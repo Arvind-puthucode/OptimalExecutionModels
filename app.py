@@ -40,13 +40,33 @@ if 'connection_attempts' not in st.session_state:
     st.session_state.connection_attempts = 0
 
 
+def update_session_order_book():
+    """Update the session state order book with data from the client"""
+    # Get client instance
+    client = OrderBookClient.get_instance()
+    
+    # Only update if there's data
+    if client.has_data():
+        # Get data from client
+        bids, asks = client.get_bids_asks()
+        
+        # Convert to format expected by OrderBook.update()
+        processed_data = {
+            'bids': [[str(price), str(qty)] for price, qty in bids.items()],
+            'asks': [[str(price), str(qty)] for price, qty in asks.items()]
+        }
+        
+        # Update session state order book
+        st.session_state.order_book.update(processed_data)
+        st.session_state.last_update_time = client.last_update_time
+        return True
+    return False
+
+
 def on_orderbook_update(data):
-    """Callback function to handle order book updates"""
+    """Callback function to handle order book updates - only logging, no session state access"""
     try:
-        # Update the order book in session state
-        st.session_state.order_book.update(data)
-        st.session_state.last_update_time = time.time()
-        logging.info(f"Updated order book: {len(data.get('bids', []))} bids, {len(data.get('asks', []))} asks")
+        logging.info(f"Received order book update: {len(data.get('bids', []))} bids, {len(data.get('asks', []))} asks")
     except Exception as e:
         logging.error(f"Error in order book update callback: {e}")
 
@@ -56,7 +76,7 @@ def init_client():
     # Get client singleton
     client = OrderBookClient.get_instance()
     
-    # Register callback for order book updates
+    # Register callback for order book updates (just for logging)
     client.remove_callback(on_orderbook_update)  # Remove if already registered
     client.add_callback(on_orderbook_update)
     
@@ -64,6 +84,9 @@ def init_client():
     if not client.is_connected():
         success = client.connect()
         st.session_state.connected = success
+        if success:
+            # Increment connection attempts on success (to track reconnections)
+            st.session_state.connection_attempts += 1
         return success
     else:
         st.session_state.connected = True
@@ -232,23 +255,41 @@ def main():
     # Initialize connection to order book data
     connection_status = init_client()
     
+    # Update session state order book from client (live data)
+    if connection_status:
+        data_updated = update_session_order_book()
+        if data_updated:
+            logging.info("Updated session state order book from client")
+    
     # Sidebar inputs
     st.sidebar.header("Order Parameters")
     
     # Connection status indicator
     connection_indicator = st.sidebar.empty()
-    if connection_status:
+    
+    # Get client
+    client = OrderBookClient.get_instance()
+    
+    # Check real connection status
+    real_connection = client.is_connected() and client.has_data()
+    
+    if real_connection:
         connection_indicator.success("Connected to order book stream")
     else:
         connection_indicator.warning("Not connected to order book stream")
         if st.sidebar.button("Attempt Reconnection"):
             # Reset client and try to reconnect
-            client = OrderBookClient.get_instance()
             client.reset()
             st.session_state.connected = False
             reconnected = init_client()
             if reconnected:
-                st.sidebar.success("Successfully reconnected")
+                # Wait a moment for data to arrive
+                time.sleep(1)
+                data_updated = update_session_order_book()
+                if data_updated:
+                    st.sidebar.success("Successfully reconnected and received data")
+                else:
+                    st.sidebar.warning("Reconnected but no data received yet")
                 st.experimental_rerun()
             else:
                 st.sidebar.error("Failed to reconnect")
@@ -256,17 +297,30 @@ def main():
     # Add debug information in an expandable section
     with st.sidebar.expander("Debug Information", expanded=False):
         last_update = time.strftime('%H:%M:%S', time.localtime(st.session_state.last_update_time)) if st.session_state.last_update_time > 0 else 'Never'
+        client_update = time.strftime('%H:%M:%S', time.localtime(client.last_update_time)) if client.last_update_time > 0 else 'Never'
         
-        st.markdown(f"Connection Status: {'Connected' if connection_status else 'Disconnected'}")
-        st.markdown(f"Last Update Time: {last_update}")
+        st.markdown(f"Connected to API: {client.is_connected()}")
+        st.markdown(f"Client has data: {client.has_data()}")
+        st.markdown(f"Session state connected: {st.session_state.connected}")
+        st.markdown(f"Last Update (Session): {last_update}")
+        st.markdown(f"Last Update (Client): {client_update}")
         st.markdown(f"Connection Attempts: {st.session_state.connection_attempts}")
-        st.markdown(f"Order Book Size: {len(st.session_state.order_book.bids)} bids, {len(st.session_state.order_book.asks)} asks")
+        st.markdown(f"Cached Order Book Size: {len(st.session_state.order_book.bids)} bids, {len(st.session_state.order_book.asks)} asks")
+        st.markdown(f"Client Order Book Size: {len(client.bids)} bids, {len(client.asks)} asks")
         
-        if st.button("Print Debug Info"):
-            client = OrderBookClient.get_instance()
+        if st.button("Force Update from Client", key="force_update"):
+            updated = update_session_order_book()
+            if updated:
+                st.success("Successfully updated order book from client")
+                st.experimental_rerun()
+            else:
+                st.error("Failed to update - no data available from client")
+        
+        if st.button("Print Debug Info", key="debug_info"):
             logging.info(f"Client connected: {client.is_connected()}")
+            logging.info(f"Client has data: {client.has_data()}")
             logging.info(f"Session state connected: {st.session_state.connected}")
-            logging.info(f"Order book state: {st.session_state.order_book.get_snapshot()}")
+            logging.info(f"Order book state (client): {client.get_order_book_snapshot()}")
     
     # Order parameters
     quantity_usd = st.sidebar.number_input(
@@ -353,7 +407,11 @@ def main():
     col1, col2 = st.columns(2)
     
     # Get the order book - live or sample
-    has_valid_data = connection_status and len(st.session_state.order_book.bids) > 0 and len(st.session_state.order_book.asks) > 0
+    has_valid_data = real_connection and len(st.session_state.order_book.bids) > 0 and len(st.session_state.order_book.asks) > 0
+    
+    # If we're connected but session state doesn't have data, try to update it
+    if real_connection and not has_valid_data:
+        has_valid_data = update_session_order_book()
     
     if use_live_data and has_valid_data:
         order_book = st.session_state.order_book

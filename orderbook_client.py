@@ -4,7 +4,7 @@ import logging
 import time
 import threading
 import requests
-from typing import Dict, List, Callable, Optional, Any
+from typing import Dict, List, Callable, Optional, Any, Tuple
 
 # Try to import websockets, but provide a fallback if not available
 try:
@@ -64,6 +64,9 @@ class OrderBookClient:
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
         
+        # Lock for thread safety when updating order book
+        self.order_book_lock = threading.Lock()
+        
         OrderBookClient._initialized = True
     
     @classmethod
@@ -77,11 +80,12 @@ class OrderBookClient:
     
     def reset(self):
         """Reset the client state without destroying the singleton instance."""
-        self.callbacks = []
-        self.bids = {}
-        self.asks = {}
-        self.last_update_id = 0
-        self.last_update_time = 0
+        with self.order_book_lock:
+            self.callbacks = []
+            self.bids = {}
+            self.asks = {}
+            self.last_update_id = 0
+            self.last_update_time = 0
         
         # Stop polling if active
         if self.polling_thread and self.polling_thread.is_alive():
@@ -99,59 +103,70 @@ class OrderBookClient:
     
     def get_order_book_snapshot(self) -> Dict[str, Any]:
         """Get the current order book state."""
-        return {
-            'bids': sorted(([price, size] for price, size in self.bids.items()), reverse=True),
-            'asks': sorted(([price, size] for price, size in self.asks.items())),
-            'last_update_id': self.last_update_id,
-            'last_update_time': self.last_update_time
-        }
+        with self.order_book_lock:
+            return {
+                'bids': sorted(([price, size] for price, size in self.bids.items()), reverse=True),
+                'asks': sorted(([price, size] for price, size in self.asks.items())),
+                'last_update_id': self.last_update_id,
+                'last_update_time': self.last_update_time
+            }
     
     def get_best_bid_ask(self) -> Dict[str, float]:
         """Get the best bid and ask prices."""
-        best_bid = max(self.bids.keys()) if self.bids else None
-        best_ask = min(self.asks.keys()) if self.asks else None
-        best_bid_size = self.bids.get(best_bid, 0) if best_bid else 0
-        best_ask_size = self.asks.get(best_ask, 0) if best_ask else 0
-        
-        return {
-            'best_bid': best_bid,
-            'best_ask': best_ask,
-            'best_bid_size': best_bid_size,
-            'best_ask_size': best_ask_size,
-            'spread': best_ask - best_bid if best_bid and best_ask else None
-        }
+        with self.order_book_lock:
+            best_bid = max(self.bids.keys()) if self.bids else None
+            best_ask = min(self.asks.keys()) if self.asks else None
+            best_bid_size = self.bids.get(best_bid, 0) if best_bid else 0
+            best_ask_size = self.asks.get(best_ask, 0) if best_ask else 0
+            
+            return {
+                'best_bid': best_bid,
+                'best_ask': best_ask,
+                'best_bid_size': best_bid_size,
+                'best_ask_size': best_ask_size,
+                'spread': best_ask - best_bid if best_bid and best_ask else None
+            }
+    
+    def get_bids_asks(self) -> Tuple[Dict[float, float], Dict[float, float]]:
+        """Get the current bids and asks."""
+        with self.order_book_lock:
+            return self.bids.copy(), self.asks.copy()
     
     def _process_orderbook_update(self, data: Dict[str, Any]) -> None:
         """Process an order book update."""
         try:
-            # Update order book state
-            if 'bids' in data:
-                for price_str, size_str in data['bids']:
-                    price = float(price_str)
-                    size = float(size_str)
-                    if size == 0:
-                        if price in self.bids:
-                            del self.bids[price]
-                    else:
-                        self.bids[price] = size
+            # Update order book state in a thread-safe way
+            with self.order_book_lock:
+                # Update order book state
+                if 'bids' in data:
+                    for price_str, size_str in data['bids']:
+                        price = float(price_str)
+                        size = float(size_str)
+                        if size == 0:
+                            if price in self.bids:
+                                del self.bids[price]
+                        else:
+                            self.bids[price] = size
+                
+                if 'asks' in data:
+                    for price_str, size_str in data['asks']:
+                        price = float(price_str)
+                        size = float(size_str)
+                        if size == 0:
+                            if price in self.asks:
+                                del self.asks[price]
+                        else:
+                            self.asks[price] = size
+                
+                # Update metadata
+                if 'update_id' in data:
+                    self.last_update_id = data['update_id']
+                self.last_update_time = time.time()
             
-            if 'asks' in data:
-                for price_str, size_str in data['asks']:
-                    price = float(price_str)
-                    size = float(size_str)
-                    if size == 0:
-                        if price in self.asks:
-                            del self.asks[price]
-                    else:
-                        self.asks[price] = size
-            
-            # Update metadata
-            if 'update_id' in data:
-                self.last_update_id = data['update_id']
-            self.last_update_time = time.time()
-            
-            # Call registered callbacks
+            # Get snapshot for callbacks
             snapshot = self.get_order_book_snapshot()
+            
+            # Call registered callbacks with the snapshot
             for callback in self.callbacks:
                 try:
                     callback(snapshot)
@@ -202,7 +217,8 @@ class OrderBookClient:
             # Start polling in a background thread
             self.polling_thread = threading.Thread(
                 target=self._poll_http_endpoint,
-                daemon=True
+                daemon=True,
+                name="OrderBookPoller"
             )
             self.polling_thread.start()
             self.logger.info("Started HTTP polling for order book data")
@@ -217,10 +233,15 @@ class OrderBookClient:
             self.keep_polling = False
             self.logger.info("Stopping HTTP polling")
     
+    def has_data(self):
+        """Check if the order book has data."""
+        with self.order_book_lock:
+            return len(self.bids) > 0 and len(self.asks) > 0
+    
     def is_connected(self):
         """Check if client is receiving order book updates."""
-        # If we've received an update in the last 10 seconds, consider connected
-        return (time.time() - self.last_update_time) < 10 
+        # If we've received an update in the last 10 seconds and have data, consider connected
+        return (time.time() - self.last_update_time) < 10 and self.has_data()
     
     def connect(self):
         """
