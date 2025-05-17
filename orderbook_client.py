@@ -38,7 +38,7 @@ class OrderBookClient:
         
         # URLs
         self.websocket_url = websocket_url or "wss://ws.gomarket-cpp.goquant.io/ws/l2-orderbook/okx/BTC-USDT-SWAP"
-        self.http_url = http_url or "https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=1000"
+        self.http_url = http_url or "https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=1000000"
         
         # State
         self.bids: Dict[float, float] = {}  # price -> size
@@ -190,8 +190,8 @@ class OrderBookClient:
                     
                     # Convert to format expected by _process_orderbook_update
                     processed_data = {
-                        'bids': [[str(x[0]), str(x[1])] for x in data.get('bids', [])[:100]],
-                        'asks': [[str(x[0]), str(x[1])] for x in data.get('asks', [])[:100]],
+                        'bids': [[str(x[0]), str(x[1])] for x in data.get('bids', [])],
+                        'asks': [[str(x[0]), str(x[1])] for x in data.get('asks', [])],
                         'update_id': data.get('lastUpdateId', 0)
                     }
                     

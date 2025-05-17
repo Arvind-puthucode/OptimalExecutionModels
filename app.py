@@ -310,23 +310,50 @@ def plot_orderbook_heatmap(order_book, depth=20, normalize=True):
     bids = order_book.get_bids(depth)
     asks = order_book.get_asks(depth)
     
+    # Check if we have data to display
+    if not bids and not asks:
+        # Create empty figure with message
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No order book data available",
+            showarrow=False,
+            font=dict(size=15, color="red"),
+            xref="paper", yref="paper",
+            x=0.5, y=0.5
+        )
+        fig.update_layout(
+            title="Order Book Heatmap - No Data",
+            height=250
+        )
+        return fig
+    
     # Create dataframes for bids and asks
     bid_prices = [float(bid[0]) for bid in bids]
     bid_quantities = [float(bid[1]) for bid in bids]
-    bid_depths = np.cumsum(bid_quantities)
+    bid_depths = np.cumsum(bid_quantities) if bid_quantities else []
     
     ask_prices = [float(ask[0]) for ask in asks]
     ask_quantities = [float(ask[1]) for ask in asks]
-    ask_depths = np.cumsum(ask_quantities)
+    ask_depths = np.cumsum(ask_quantities) if ask_quantities else []
     
     # Create a single array for all price levels
-    all_prices = np.concatenate([np.array(bid_prices)[::-1], np.array(ask_prices)])
+    if bid_prices and ask_prices:
+        all_prices = np.concatenate([np.array(bid_prices)[::-1], np.array(ask_prices)])
+    elif bid_prices:
+        all_prices = np.array(bid_prices)
+    elif ask_prices:
+        all_prices = np.array(ask_prices)
+    else:
+        all_prices = np.array([])
     
     # For normalized view
     if normalize:
-        max_qty = max(max(bid_quantities), max(ask_quantities))
-        bid_intensity = np.array(bid_quantities) / max_qty
-        ask_intensity = np.array(ask_quantities) / max_qty
+        max_bid_qty = max(bid_quantities) if bid_quantities else 0
+        max_ask_qty = max(ask_quantities) if ask_quantities else 0
+        max_qty = max(max_bid_qty, max_ask_qty) if (max_bid_qty > 0 or max_ask_qty > 0) else 1
+        
+        bid_intensity = np.array(bid_quantities) / max_qty if bid_quantities else np.array([])
+        ask_intensity = np.array(ask_quantities) / max_qty if ask_quantities else np.array([])
     else:
         bid_intensity = bid_quantities
         ask_intensity = ask_quantities
@@ -334,30 +361,32 @@ def plot_orderbook_heatmap(order_book, depth=20, normalize=True):
     # Create the heatmap figure
     fig = go.Figure()
     
-    # Add bid heatmap (greens)
-    fig.add_trace(go.Heatmap(
-        z=[bid_intensity],
-        x=bid_prices,
-        y=['Bids'],
-        colorscale=[[0, 'rgba(0,50,0,0.2)'], [1, 'rgba(0,255,0,1)']],
-        showscale=False,
-        text=[[f"Price: {p}<br>Quantity: {q}<br>Depth: {d}" for p, q, d in zip(bid_prices, bid_quantities, bid_depths)]],
-        hoverinfo='text'
-    ))
+    # Add bid heatmap (greens) if we have bids
+    if bid_prices and bid_quantities:
+        fig.add_trace(go.Heatmap(
+            z=[bid_intensity],
+            x=bid_prices,
+            y=['Bids'],
+            colorscale=[[0, 'rgba(0,50,0,0.2)'], [1, 'rgba(0,255,0,1)']],
+            showscale=False,
+            text=[[f"Price: {p}<br>Quantity: {q}<br>Depth: {d}" for p, q, d in zip(bid_prices, bid_quantities, bid_depths)]],
+            hoverinfo='text'
+        ))
     
-    # Add ask heatmap (reds)
-    fig.add_trace(go.Heatmap(
-        z=[ask_intensity],
-        x=ask_prices,
-        y=['Asks'],
-        colorscale=[[0, 'rgba(50,0,0,0.2)'], [1, 'rgba(255,0,0,1)']],
-        showscale=False,
-        text=[[f"Price: {p}<br>Quantity: {q}<br>Depth: {d}" for p, q, d in zip(ask_prices, ask_quantities, ask_depths)]],
-        hoverinfo='text'
-    ))
+    # Add ask heatmap (reds) if we have asks
+    if ask_prices and ask_quantities:
+        fig.add_trace(go.Heatmap(
+            z=[ask_intensity],
+            x=ask_prices,
+            y=['Asks'],
+            colorscale=[[0, 'rgba(50,0,0,0.2)'], [1, 'rgba(255,0,0,1)']],
+            showscale=False,
+            text=[[f"Price: {p}<br>Quantity: {q}<br>Depth: {d}" for p, q, d in zip(ask_prices, ask_quantities, ask_depths)]],
+            hoverinfo='text'
+        ))
     
     # Highlight the spread
-    if bids and asks:
+    if bid_prices and ask_prices:
         best_bid = max(bid_prices)
         best_ask = min(ask_prices)
         spread = best_ask - best_bid
@@ -374,6 +403,11 @@ def plot_orderbook_heatmap(order_book, depth=20, normalize=True):
             line=dict(color="gray", width=1, dash="dot"),
             layer="below"
         )
+        
+        # Add spread annotation
+        spread_text = f"Spread: {spread:.2f} ({spread_pct:.4f}%)"
+    else:
+        spread_text = "No spread available"
 
     # Update layout
     fig.update_layout(
@@ -392,7 +426,7 @@ def plot_orderbook_heatmap(order_book, depth=20, normalize=True):
                 x=0.5,
                 y=-0.15,
                 showarrow=False,
-                text=f"Spread: {spread:.2f} ({spread_pct:.4f}%)" if 'spread' in locals() else "",
+                text=spread_text,
                 xref="paper",
                 yref="paper",
                 font=dict(size=12)
@@ -2197,17 +2231,346 @@ def main():
         with viz_tabs[0]:
             st.subheader("Order Book Heatmap")
             
-            col1, col2 = st.columns([1, 1])
+            col1, col2, col3 = st.columns([1, 1, 1])
             with col1:
                 heatmap_depth = st.slider("Depth to Display", 5, 50, 20, 
                                          help="Number of price levels to display in the heatmap")
             with col2:
                 normalize = st.checkbox("Normalize Quantities", value=True, 
                                       help="Normalize quantities for better visualization")
+            with col3:
+                show_table = st.checkbox("Show Table View", value=False,
+                                       help="Display order book data in tabular format")
             
-            # Display the heatmap
-            heatmap_fig = plot_orderbook_heatmap(st.session_state.order_book, heatmap_depth, normalize)
-            st.plotly_chart(heatmap_fig, use_container_width=True)
+            # Add visualization type options
+            viz_options = st.columns([1, 1, 1])
+            with viz_options[0]:
+                viz_type = st.selectbox(
+                    "Visualization Type",
+                    ["Standard Heatmap", "Enhanced Depth View", "Step Chart"],
+                    help="Select the visualization type best suited for your data"
+                )
+            with viz_options[1]:
+                use_log_scale = st.checkbox("Use Log Scale", value=False,
+                                         help="Apply logarithmic scaling to better visualize different quantity sizes")
+            with viz_options[2]:
+                highlight_spread = st.checkbox("Highlight Spread", value=True,
+                                          help="Highlight the spread between bid and ask")
+            
+            # Display the heatmap or alternative visualization based on selection
+            if viz_type == "Standard Heatmap":
+                heatmap_fig = plot_orderbook_heatmap(st.session_state.order_book, heatmap_depth, normalize)
+                st.plotly_chart(heatmap_fig, use_container_width=True)
+            elif viz_type == "Enhanced Depth View":
+                # Get order book data
+                bids = st.session_state.order_book.get_bids(heatmap_depth)
+                asks = st.session_state.order_book.get_asks(heatmap_depth)
+                
+                # Create enhanced depth view
+                fig = go.Figure()
+                
+                # Process bid data
+                if bids:
+                    bid_prices = [float(bid[0]) for bid in bids]
+                    bid_quantities = [float(bid[1]) for bid in bids]
+                    
+                    # Apply log scale if selected
+                    if use_log_scale and any(q > 0 for q in bid_quantities):
+                        bid_quantities = [np.log10(q) if q > 0 else 0 for q in bid_quantities]
+                    
+                    # Add bids as filled area
+                    fig.add_trace(go.Scatter(
+                        x=bid_prices,
+                        y=bid_quantities,
+                        fill='tozeroy',
+                        mode='lines',
+                        line=dict(width=0),
+                        fillcolor='rgba(0, 128, 0, 0.5)',
+                        name='Bids',
+                        hovertemplate='Price: $%{x:.2f}<br>Quantity: %{text}',
+                        text=[f"{q:.6f}" for q in [float(bid[1]) for bid in bids]]
+                    ))
+                
+                # Process ask data
+                if asks:
+                    ask_prices = [float(ask[0]) for ask in asks]
+                    ask_quantities = [float(ask[1]) for ask in asks]
+                    
+                    # Apply log scale if selected
+                    if use_log_scale and any(q > 0 for q in ask_quantities):
+                        ask_quantities = [np.log10(q) if q > 0 else 0 for q in ask_quantities]
+                    
+                    # Add asks as filled area
+                    fig.add_trace(go.Scatter(
+                        x=ask_prices,
+                        y=ask_quantities,
+                        fill='tozeroy',
+                        mode='lines',
+                        line=dict(width=0),
+                        fillcolor='rgba(255, 0, 0, 0.5)',
+                        name='Asks',
+                        hovertemplate='Price: $%{x:.2f}<br>Quantity: %{text}',
+                        text=[f"{q:.6f}" for q in [float(ask[1]) for ask in asks]]
+                    ))
+                
+                # Highlight the spread if requested
+                if highlight_spread and bids and asks:
+                    best_bid = max(float(bid[0]) for bid in bids)
+                    best_ask = min(float(ask[0]) for ask in asks)
+                    spread = best_ask - best_bid
+                    mid_price = (best_bid + best_ask) / 2
+                    
+                    fig.add_shape(
+                        type="rect",
+                        x0=best_bid,
+                        x1=best_ask,
+                        y0=0,
+                        y1=max(fig.data[0]['y']) if len(fig.data) > 0 and len(fig.data[0]['y']) > 0 else 1,
+                        fillcolor="rgba(150, 150, 150, 0.2)",
+                        line=dict(width=0),
+                        layer="below"
+                    )
+                    
+                    # Add spread annotation
+                    fig.add_annotation(
+                        x=mid_price,
+                        y=0,
+                        text=f"Spread: ${spread:.2f}",
+                        showarrow=True,
+                        arrowhead=2,
+                        arrowsize=1,
+                        arrowwidth=2,
+                        arrowcolor="#636363",
+                        ax=0,
+                        ay=-30,
+                        bordercolor="#c7c7c7",
+                        borderwidth=2,
+                        borderpad=4,
+                        bgcolor="#ff7f0e",
+                        opacity=0.8
+                    )
+                
+                # Update layout
+                fig.update_layout(
+                    title=f"Enhanced Order Book Depth View{' (Log Scale)' if use_log_scale else ''}",
+                    xaxis_title="Price",
+                    yaxis_title=f"{'Log10(Quantity)' if use_log_scale else 'Quantity'}",
+                    height=400,
+                    showlegend=True
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+                
+            elif viz_type == "Step Chart":
+                # Get order book data
+                bids = st.session_state.order_book.get_bids(heatmap_depth)
+                asks = st.session_state.order_book.get_asks(heatmap_depth)
+                
+                # Create step chart visualization
+                fig = go.Figure()
+                
+                # Process bid data for cumulative representation
+                if bids:
+                    bid_prices = [float(bid[0]) for bid in bids]
+                    bid_quantities = [float(bid[1]) for bid in bids]
+                    bid_cumulative = np.cumsum(bid_quantities)
+                    
+                    # Apply log scale if selected
+                    if use_log_scale and any(q > 0 for q in bid_cumulative):
+                        bid_cumulative = [np.log10(q) if q > 0 else 0 for q in bid_cumulative]
+                    
+                    # Add bids as step chart - reverse the order for bid side
+                    fig.add_trace(go.Scatter(
+                        x=bid_prices[::-1],
+                        y=bid_cumulative[::-1],
+                        mode='lines',
+                        line=dict(shape='hv', width=3, color='green'),
+                        name='Cumulative Bids',
+                        hovertemplate='Price: $%{x:.2f}<br>Cumulative Quantity: %{text}',
+                        text=[f"{q:.6f}" for q in np.cumsum([float(bid[1]) for bid in bids])[::-1]]
+                    ))
+                
+                # Process ask data for cumulative representation
+                if asks:
+                    ask_prices = [float(ask[0]) for ask in asks]
+                    ask_quantities = [float(ask[1]) for ask in asks]
+                    ask_cumulative = np.cumsum(ask_quantities)
+                    
+                    # Apply log scale if selected
+                    if use_log_scale and any(q > 0 for q in ask_cumulative):
+                        ask_cumulative = [np.log10(q) if q > 0 else 0 for q in ask_cumulative]
+                    
+                    # Add asks as step chart
+                    fig.add_trace(go.Scatter(
+                        x=ask_prices,
+                        y=ask_cumulative,
+                        mode='lines',
+                        line=dict(shape='hv', width=3, color='red'),
+                        name='Cumulative Asks',
+                        hovertemplate='Price: $%{x:.2f}<br>Cumulative Quantity: %{text}',
+                        text=[f"{q:.6f}" for q in np.cumsum([float(ask[1]) for ask in asks])]
+                    ))
+                
+                # Highlight the spread if requested
+                if highlight_spread and bids and asks:
+                    best_bid = max(float(bid[0]) for bid in bids)
+                    best_ask = min(float(ask[0]) for ask in asks)
+                    spread = best_ask - best_bid
+                    mid_price = (best_bid + best_ask) / 2
+                    
+                    # Add vertical lines for best bid and ask
+                    fig.add_shape(
+                        type="line",
+                        x0=best_bid, y0=0,
+                        x1=best_bid, y1=max(fig.data[0]['y']) if len(fig.data) > 0 and len(fig.data[0]['y']) > 0 else 1,
+                        line=dict(color="darkgreen", width=2, dash="dash")
+                    )
+                    
+                    fig.add_shape(
+                        type="line",
+                        x0=best_ask, y0=0,
+                        x1=best_ask, y1=max(fig.data[1]['y']) if len(fig.data) > 1 and len(fig.data[1]['y']) > 0 else 1,
+                        line=dict(color="darkred", width=2, dash="dash")
+                    )
+                    
+                    # Add spread annotation
+                    fig.add_annotation(
+                        x=mid_price,
+                        y=0,
+                        text=f"Spread: ${spread:.2f}",
+                        showarrow=True,
+                        arrowhead=2,
+                        arrowsize=1,
+                        arrowwidth=2,
+                        arrowcolor="#636363",
+                        ax=0,
+                        ay=-30,
+                        bordercolor="#c7c7c7",
+                        borderwidth=2,
+                        borderpad=4,
+                        bgcolor="#ff7f0e",
+                        opacity=0.8
+                    )
+                
+                # Update layout
+                fig.update_layout(
+                    title=f"Order Book Depth - Step Chart{' (Log Scale)' if use_log_scale else ''}",
+                    xaxis_title="Price",
+                    yaxis_title=f"{'Log10(Cumulative Quantity)' if use_log_scale else 'Cumulative Quantity'}",
+                    height=400,
+                    showlegend=True
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # Display tabular view if requested
+            if show_table:
+                st.subheader("Order Book Data (Tabular View)")
+                
+                # Get order book data
+                bids = st.session_state.order_book.get_bids(heatmap_depth)
+                asks = st.session_state.order_book.get_asks(heatmap_depth)
+                
+                # Create dataframes
+                if bids:
+                    bid_df = pd.DataFrame(bids, columns=["Price", "Quantity"])
+                    bid_df["Cumulative"] = bid_df["Quantity"].cumsum()
+                    bid_df["Side"] = "Bid"
+                    bid_df["Value ($)"] = bid_df["Price"].astype(float) * bid_df["Quantity"].astype(float)
+                    bid_df = bid_df[["Side", "Price", "Quantity", "Cumulative", "Value ($)"]]
+                else:
+                    bid_df = pd.DataFrame(columns=["Side", "Price", "Quantity", "Cumulative", "Value ($)"])
+                
+                if asks:
+                    ask_df = pd.DataFrame(asks, columns=["Price", "Quantity"])
+                    ask_df["Cumulative"] = ask_df["Quantity"].cumsum()
+                    ask_df["Side"] = "Ask"
+                    ask_df["Value ($)"] = ask_df["Price"].astype(float) * ask_df["Quantity"].astype(float)
+                    ask_df = ask_df[["Side", "Price", "Quantity", "Cumulative", "Value ($)"]]
+                else:
+                    ask_df = pd.DataFrame(columns=["Side", "Price", "Quantity", "Cumulative", "Value ($)"])
+                
+                # Format the dataframes
+                for df in [bid_df, ask_df]:
+                    if not df.empty:
+                        df["Price"] = df["Price"].astype(float).map("${:.2f}".format)
+                        df["Quantity"] = df["Quantity"].astype(float).map("{:.6f}".format)
+                        df["Cumulative"] = df["Cumulative"].astype(float).map("{:.6f}".format)
+                        df["Value ($)"] = df["Value ($)"].map("${:.2f}".format)
+                
+                # Display two tables side-by-side
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.subheader("Bids")
+                    st.dataframe(bid_df, use_container_width=True)
+                
+                with col2:
+                    st.subheader("Asks")
+                    st.dataframe(ask_df, use_container_width=True)
+                
+                # Add summary metrics
+                st.subheader("Order Book Summary")
+                summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
+                
+                # Get bid/ask prices
+                best_bid = st.session_state.order_book.get_best_bid()
+                best_bid_price = best_bid[0] if best_bid else 0
+                best_ask = st.session_state.order_book.get_best_ask()
+                best_ask_price = best_ask[0] if best_ask else 0
+                spread = best_ask_price - best_bid_price if best_bid and best_ask else 0
+                
+                # Calculate volumes for metrics
+                total_bid_volume = sum(float(bid[1]) for bid in bids) if bids else 0
+                total_ask_volume = sum(float(ask[1]) for ask in asks) if asks else 0
+                total_volume = total_bid_volume + total_ask_volume
+                
+                with summary_col1:
+                    # Calculate mid price
+                    mid_price = (best_bid_price + best_ask_price) / 2 if best_bid and best_ask else 0
+                    st.metric("Mid Price", f"${mid_price:.2f}")
+                
+                with summary_col2:
+                    # Show spread
+                    st.metric("Spread", f"${spread:.2f}")
+                
+                with summary_col3:
+                    # Calculate spread in basis points
+                    if best_bid_price > 0:
+                        spread_bps = (spread / best_bid_price) * 10000
+                        st.metric("Spread (bps)", f"{spread_bps:.2f}")
+                    else:
+                        st.metric("Spread (bps)", "N/A")
+                
+                with summary_col4:
+                    # Calculate bid/ask ratio (imbalance)
+                    if total_ask_volume > 0:
+                        bid_ask_ratio = total_bid_volume / total_ask_volume
+                        st.metric("Bid/Ask Ratio", f"{bid_ask_ratio:.2f}")
+                    else:
+                        st.metric("Bid/Ask Ratio", "N/A")
+                
+                # Add volume metrics in a second row
+                volume_col1, volume_col2, volume_col3, volume_col4 = st.columns(4)
+                
+                with volume_col1:
+                    st.metric("Bid Volume", f"{total_bid_volume:.6f}")
+                
+                with volume_col2:
+                    st.metric("Ask Volume", f"{total_ask_volume:.6f}")
+                
+                with volume_col3:
+                    st.metric("Total Volume", f"{total_volume:.6f}")
+                
+                with volume_col4:
+                    # Calculate market pressure (positive = buying pressure, negative = selling pressure)
+                    if total_volume > 0:
+                        market_pressure = (total_bid_volume - total_ask_volume) / total_volume
+                        pressure_text = f"{market_pressure:.2%}"
+                        st.metric("Market Pressure", pressure_text, 
+                                 delta=f"{'Buy' if market_pressure > 0 else 'Sell'} Pressure",
+                                 delta_color="normal" if market_pressure > 0 else "inverse")
+                    else:
+                        st.metric("Market Pressure", "N/A")
         
         # 2. Execution Analysis tab - Walking the Book
         with viz_tabs[1]:
@@ -2251,7 +2614,7 @@ def main():
                     with col1:
                         st.metric("Avg. Execution Price", f"${metrics['avg_execution_price']:.2f}")
                     with col2:
-                        st.metric("Slippage", f"{metrics['slippage_bps']:.2f} bps")
+                        st.metric("Slippage", f"{metrics['slippage_pct']:.2f}%")
                     with col3:
                         st.metric("Total Cost", f"${metrics['total_cost']:.2f}")
                 else:
