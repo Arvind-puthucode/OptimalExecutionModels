@@ -1,32 +1,59 @@
 import json
 import asyncio
 import logging
-import websockets
-from websockets.exceptions import ConnectionClosed
 import time
+import threading
+import requests
 from typing import Dict, List, Callable, Optional, Any
+
+# Try to import websockets, but provide a fallback if not available
+try:
+    import websockets  # type: ignore
+    from websockets.exceptions import ConnectionClosed  # type: ignore
+    WEBSOCKETS_AVAILABLE = True
+except ImportError:
+    WEBSOCKETS_AVAILABLE = False
+    logging.warning("websockets package not available. Will use HTTP polling as fallback.")
 
 
 class OrderBookClient:
     """
-    WebSocket client that connects to an order book data stream,
-    processes the incoming messages, and maintains the current order book state.
+    Client that connects to order book data stream.
+    Provides both WebSocket and fallback HTTP polling methods.
     """
     
-    def __init__(self, url: str, max_reconnect_attempts: int = 10, reconnect_delay: int = 5):
-        self.url = url
-        self.max_reconnect_attempts = max_reconnect_attempts
-        self.reconnect_delay = reconnect_delay
-        self.reconnect_attempts = 0
-        self.running = False
-        self.connection: Optional[websockets.WebSocketClientProtocol] = None
-        self.callbacks: List[Callable[[Dict[str, Any]], None]] = []
+    # Singleton instance
+    _instance = None
+    _initialized = False
+    
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super(OrderBookClient, cls).__new__(cls)
+        return cls._instance
+    
+    def __init__(self, websocket_url=None, http_url=None):
+        # Only initialize once
+        if OrderBookClient._initialized:
+            return
         
-        # Order book state
+        # URLs
+        self.websocket_url = websocket_url or "wss://ws.gomarket-cpp.goquant.io/ws/l2-orderbook/okx/BTC-USDT-SWAP"
+        self.http_url = http_url or "https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=1000"
+        
+        # State
         self.bids: Dict[float, float] = {}  # price -> size
         self.asks: Dict[float, float] = {}  # price -> size
         self.last_update_id = 0
         self.last_update_time = 0
+        
+        # HTTP polling
+        self.use_websocket = WEBSOCKETS_AVAILABLE
+        self.polling_interval = 5  # seconds
+        self.polling_thread = None
+        self.keep_polling = False
+        
+        # Callbacks
+        self.callbacks: List[Callable[[Dict[str, Any]], None]] = []
         
         # Setup logging
         self.logger = logging.getLogger('OrderBookClient')
@@ -36,10 +63,39 @@ class OrderBookClient:
             formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
+        
+        OrderBookClient._initialized = True
+    
+    @classmethod
+    def get_instance(cls, websocket_url=None, http_url=None):
+        """
+        Get or create the singleton instance of the OrderBookClient.
+        """
+        if cls._instance is None:
+            cls(websocket_url, http_url)
+        return cls._instance
+    
+    def reset(self):
+        """Reset the client state without destroying the singleton instance."""
+        self.callbacks = []
+        self.bids = {}
+        self.asks = {}
+        self.last_update_id = 0
+        self.last_update_time = 0
+        
+        # Stop polling if active
+        if self.polling_thread and self.polling_thread.is_alive():
+            self.keep_polling = False
+            self.polling_thread.join(timeout=1.0)
     
     def add_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
         """Register a callback function that will be called with each order book update."""
         self.callbacks.append(callback)
+    
+    def remove_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """Remove a registered callback function."""
+        if callback in self.callbacks:
+            self.callbacks.remove(callback)
     
     def get_order_book_snapshot(self) -> Dict[str, Any]:
         """Get the current order book state."""
@@ -68,10 +124,7 @@ class OrderBookClient:
     def _process_orderbook_update(self, data: Dict[str, Any]) -> None:
         """Process an order book update."""
         try:
-            # Update order book state based on the message format
-            # Note: This implementation assumes a specific message format
-            # You may need to adjust this based on the actual data structure
-
+            # Update order book state
             if 'bids' in data:
                 for price_str, size_str in data['bids']:
                     price = float(price_str)
@@ -98,88 +151,110 @@ class OrderBookClient:
             self.last_update_time = time.time()
             
             # Call registered callbacks
+            snapshot = self.get_order_book_snapshot()
             for callback in self.callbacks:
                 try:
-                    callback(self.get_order_book_snapshot())
+                    callback(snapshot)
                 except Exception as e:
                     self.logger.error(f"Error in callback: {e}")
             
         except Exception as e:
             self.logger.error(f"Error processing order book update: {e}")
     
-    async def connect(self) -> None:
-        """Connect to the WebSocket and start processing messages."""
-        self.running = True
-        self.reconnect_attempts = 0
+    def _poll_http_endpoint(self):
+        """Poll HTTP endpoint for order book data."""
+        self.keep_polling = True
         
-        while self.running and self.reconnect_attempts < self.max_reconnect_attempts:
+        while self.keep_polling:
             try:
-                self.logger.info(f"Connecting to {self.url}")
-                async with websockets.connect(self.url) as websocket:
-                    self.connection = websocket
-                    self.reconnect_attempts = 0  # Reset on successful connection
-                    self.logger.info("Connected to the order book stream")
+                # Make HTTP request to get order book data
+                response = requests.get(self.http_url, timeout=5)
+                
+                if response.status_code == 200:
+                    data = response.json()
                     
-                    # Process messages
-                    async for message in websocket:
-                        try:
-                            data = json.loads(message)
-                            self._process_orderbook_update(data)
-                        except json.JSONDecodeError:
-                            self.logger.error(f"Failed to parse message: {message}")
-                        except Exception as e:
-                            self.logger.error(f"Error processing message: {e}")
+                    # Convert to format expected by _process_orderbook_update
+                    processed_data = {
+                        'bids': [[str(x[0]), str(x[1])] for x in data.get('bids', [])[:100]],
+                        'asks': [[str(x[0]), str(x[1])] for x in data.get('asks', [])[:100]],
+                        'update_id': data.get('lastUpdateId', 0)
+                    }
+                    
+                    # Process the data
+                    self._process_orderbook_update(processed_data)
+                    self.logger.info(f"Polled order book: {len(processed_data['bids'])} bids, {len(processed_data['asks'])} asks")
+                else:
+                    self.logger.warning(f"HTTP polling failed: {response.status_code}")
             
-            except ConnectionClosed as e:
-                self.logger.warning(f"WebSocket connection closed: {e}")
             except Exception as e:
-                self.logger.error(f"Connection error: {e}")
+                self.logger.error(f"Error polling HTTP endpoint: {e}")
             
-            # Reconnection logic
-            if self.running:
-                self.reconnect_attempts += 1
-                wait_time = self.reconnect_delay * self.reconnect_attempts
-                self.logger.info(f"Reconnecting in {wait_time} seconds (attempt {self.reconnect_attempts}/{self.max_reconnect_attempts})")
-                await asyncio.sleep(wait_time)
+            # Sleep before next poll
+            time.sleep(self.polling_interval)
+    
+    def start_polling(self):
+        """Start HTTP polling for order book data."""
+        if self.polling_thread and self.polling_thread.is_alive():
+            self.logger.info("Polling already active")
+            return True
+            
+        try:
+            # Start polling in a background thread
+            self.polling_thread = threading.Thread(
+                target=self._poll_http_endpoint,
+                daemon=True
+            )
+            self.polling_thread.start()
+            self.logger.info("Started HTTP polling for order book data")
+            return True
+        except Exception as e:
+            self.logger.error(f"Error starting polling: {e}")
+            return False
+    
+    def stop_polling(self):
+        """Stop HTTP polling."""
+        if self.polling_thread and self.polling_thread.is_alive():
+            self.keep_polling = False
+            self.logger.info("Stopping HTTP polling")
+    
+    def is_connected(self):
+        """Check if client is receiving order book updates."""
+        # If we've received an update in the last 10 seconds, consider connected
+        return (time.time() - self.last_update_time) < 10 
+    
+    def connect(self):
+        """
+        Connect to the order book data source.
+        Uses HTTP polling as it's more reliable with Streamlit.
+        """
+        return self.start_polling()
         
-        if self.reconnect_attempts >= self.max_reconnect_attempts:
-            self.logger.error("Max reconnection attempts reached. Giving up.")
-            self.running = False
-    
-    def disconnect(self) -> None:
-        """Stop the client and close the WebSocket connection."""
-        self.logger.info("Disconnecting from the order book stream")
-        self.running = False
-        if self.connection:
-            asyncio.create_task(self.connection.close())
+    def disconnect(self):
+        """Disconnect from the data source."""
+        self.stop_polling()
 
 
-async def main():
-    """Example usage of the OrderBookClient."""
-    # Initialize the client
-    url = "wss://ws.gomarket-cpp.goquant.io/ws/l2-orderbook/okx/BTC-USDT-SWAP"
-    client = OrderBookClient(url)
+# For testing
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     
-    # Define a callback to handle order book updates
-    def on_orderbook_update(order_book):
+    # Create client instance
+    client = OrderBookClient.get_instance()
+    
+    # Define callback
+    def on_update(data):
         best = client.get_best_bid_ask()
         print(f"Best Bid: {best['best_bid']}, Best Ask: {best['best_ask']}, Spread: {best['spread']}")
     
-    # Register the callback
-    client.add_callback(on_orderbook_update)
+    # Register callback
+    client.add_callback(on_update)
     
-    # Start the client in a separate task
-    client_task = asyncio.create_task(client.connect())
+    # Connect to data source
+    client.connect()
     
     try:
-        # Run for a while
-        await asyncio.sleep(60)
+        # Run for 30 seconds
+        time.sleep(30)
     finally:
-        # Clean up
+        # Disconnect
         client.disconnect()
-        await client_task
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(main()) 

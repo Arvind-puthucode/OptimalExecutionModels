@@ -1,14 +1,18 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import asyncio
 import matplotlib.pyplot as plt
 import time
+import threading
+import logging
 from orderbook import OrderBook
-from orderbook_client import OrderBookClient
+from orderbook_client import OrderBookClient  # type: ignore
 from market_order_simulator import simulate_market_order, calculate_order_metrics
 import plotly.graph_objects as go
 
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
 
 # Setup page config
 st.set_page_config(
@@ -20,6 +24,50 @@ st.set_page_config(
 # Title and description
 st.title("Market Order Simulator")
 st.markdown("Simulate market orders and analyze their execution based on real-time order book data.")
+
+
+# Initialize the OrderBook global state
+if 'order_book' not in st.session_state:
+    st.session_state.order_book = OrderBook("BTC-USDT-SWAP")
+    
+if 'last_update_time' not in st.session_state:
+    st.session_state.last_update_time = 0
+    
+if 'connected' not in st.session_state:
+    st.session_state.connected = False
+    
+if 'connection_attempts' not in st.session_state:
+    st.session_state.connection_attempts = 0
+
+
+def on_orderbook_update(data):
+    """Callback function to handle order book updates"""
+    try:
+        # Update the order book in session state
+        st.session_state.order_book.update(data)
+        st.session_state.last_update_time = time.time()
+        logging.info(f"Updated order book: {len(data.get('bids', []))} bids, {len(data.get('asks', []))} asks")
+    except Exception as e:
+        logging.error(f"Error in order book update callback: {e}")
+
+
+def init_client():
+    """Initialize order book client and start connection"""
+    # Get client singleton
+    client = OrderBookClient.get_instance()
+    
+    # Register callback for order book updates
+    client.remove_callback(on_orderbook_update)  # Remove if already registered
+    client.add_callback(on_orderbook_update)
+    
+    # Start connection if not already connected
+    if not client.is_connected():
+        success = client.connect()
+        st.session_state.connected = success
+        return success
+    else:
+        st.session_state.connected = True
+        return True
 
 
 def plot_orderbook(order_book, depth=15, highlight_levels=None):
@@ -181,8 +229,44 @@ def apply_volatility(simulation_result, volatility_factor):
 
 
 def main():
+    # Initialize connection to order book data
+    connection_status = init_client()
+    
     # Sidebar inputs
     st.sidebar.header("Order Parameters")
+    
+    # Connection status indicator
+    connection_indicator = st.sidebar.empty()
+    if connection_status:
+        connection_indicator.success("Connected to order book stream")
+    else:
+        connection_indicator.warning("Not connected to order book stream")
+        if st.sidebar.button("Attempt Reconnection"):
+            # Reset client and try to reconnect
+            client = OrderBookClient.get_instance()
+            client.reset()
+            st.session_state.connected = False
+            reconnected = init_client()
+            if reconnected:
+                st.sidebar.success("Successfully reconnected")
+                st.experimental_rerun()
+            else:
+                st.sidebar.error("Failed to reconnect")
+    
+    # Add debug information in an expandable section
+    with st.sidebar.expander("Debug Information", expanded=False):
+        last_update = time.strftime('%H:%M:%S', time.localtime(st.session_state.last_update_time)) if st.session_state.last_update_time > 0 else 'Never'
+        
+        st.markdown(f"Connection Status: {'Connected' if connection_status else 'Disconnected'}")
+        st.markdown(f"Last Update Time: {last_update}")
+        st.markdown(f"Connection Attempts: {st.session_state.connection_attempts}")
+        st.markdown(f"Order Book Size: {len(st.session_state.order_book.bids)} bids, {len(st.session_state.order_book.asks)} asks")
+        
+        if st.button("Print Debug Info"):
+            client = OrderBookClient.get_instance()
+            logging.info(f"Client connected: {client.is_connected()}")
+            logging.info(f"Session state connected: {st.session_state.connected}")
+            logging.info(f"Order book state: {st.session_state.order_book.get_snapshot()}")
     
     # Order parameters
     quantity_usd = st.sidebar.number_input(
@@ -224,7 +308,8 @@ def main():
     market = st.sidebar.selectbox(
         "Market",
         options=["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"],
-        index=0
+        index=0,
+        help="Select trading pair. Note: Currently, only BTC-USDT-SWAP is connected with real data."
     )
     
     # Advanced options
@@ -246,6 +331,12 @@ def main():
             step=0.1,
             help="Multiplier for the estimated price impact"
         )
+        
+        use_live_data = st.checkbox(
+            "Use Live Data",
+            value=True,
+            help="Use real-time order book data. If disabled, will use simulated data."
+        )
     
     # Action buttons
     col1, col2 = st.sidebar.columns(2)
@@ -261,12 +352,29 @@ def main():
     # Main panel
     col1, col2 = st.columns(2)
     
-    # Get sample order book for demonstration
-    order_book = get_sample_orderbook(market)
+    # Get the order book - live or sample
+    has_valid_data = connection_status and len(st.session_state.order_book.bids) > 0 and len(st.session_state.order_book.asks) > 0
+    
+    if use_live_data and has_valid_data:
+        order_book = st.session_state.order_book
+        # Check if the order book has been updated recently
+        if time.time() - st.session_state.last_update_time > 30:
+            # Show warning if the order book hasn't been updated recently
+            st.warning("Order book data may be stale. Last update was over 30 seconds ago.")
+    else:
+        if use_live_data and not has_valid_data:
+            st.warning("No live data available. Using simulated order book data.")
+        order_book = get_sample_orderbook(market)
     
     # Order book visualization
     with col1:
         st.subheader("Order Book Depth Chart")
+        
+        # Show live data indicator
+        if use_live_data and has_valid_data:
+            st.success("Using live order book data")
+        else:
+            st.info("Using simulated order book data")
         
         # Placeholder for order book visualization
         orderbook_placeholder = st.empty()
