@@ -7,8 +7,10 @@ import threading
 import logging
 from orderbook import OrderBook
 from orderbook_client import OrderBookClient  # type: ignore
-from market_order_simulator import simulate_market_order, calculate_order_metrics
+from market_order_simulator import simulate_market_order, calculate_order_metrics, simulate_market_order_with_ml
+from regression_models import SlippageModel, SlippageDataCollector
 import plotly.graph_objects as go
+import plotly.express as px
 
 
 # Setup logging
@@ -251,6 +253,36 @@ def apply_volatility(simulation_result, volatility_factor):
     return result
 
 
+def calculate_almgren_chriss_impact(order_size_usd, market_depth, volatility, side="buy"):
+    """
+    Calculate price impact using Almgren-Chriss model
+    
+    Args:
+        order_size_usd: Order size in USD
+        market_depth: Depth of market (typically sum of quantities in order book)
+        volatility: Market volatility
+        side: Order side (buy/sell)
+        
+    Returns:
+        Estimated price impact in percentage
+    """
+    # Constants for the model (should be calibrated for specific markets)
+    sigma = volatility  # Market volatility
+    gamma = 0.1  # Market impact coefficient (higher = more impact)
+    
+    # Calculate temporary impact
+    if market_depth > 0:
+        temporary_impact = gamma * sigma * np.sqrt(order_size_usd / market_depth)
+    else:
+        temporary_impact = 0.5  # Fallback for low liquidity
+    
+    # Adjust for side (sell orders have negative impact)
+    if side.lower() == "sell":
+        temporary_impact = -temporary_impact
+        
+    return temporary_impact * 100  # Convert to percentage
+
+
 def main():
     # Initialize connection to order book data
     connection_status = init_client()
@@ -391,13 +423,72 @@ def main():
             value=True,
             help="Use real-time order book data. If disabled, will use simulated data."
         )
+        
+        use_ml_model = st.checkbox(
+            "Use ML-based Slippage Prediction",
+            value=False,
+            help="Use machine learning to predict slippage instead of simulating market order execution"
+        )
+        
+        # Impact model selection 
+        impact_model = st.selectbox(
+            "Impact Model",
+            options=["Standard", "Almgren-Chriss", "Square Root"],
+            index=0,
+            help="Select market impact model for price impact calculation"
+        )
+        
+        if use_ml_model:
+            risk_level = st.select_slider(
+                "Risk Level",
+                options=["Conservative (q90)", "Moderate (q75)", "Balanced (q50)", "Aggressive (q25)", "Optimistic (q10)", "Mean"],
+                value="Balanced (q50)",
+                help="Risk level for slippage prediction. Higher percentiles give more conservative estimates."
+            )
+            # Extract the risk level code from the selection
+            risk_level_code = risk_level.split("(")[1].split(")")[0] if "(" in risk_level else "mean"
+        else:
+            risk_level_code = "q50"  # Default
     
     # Action buttons
-    col1, col2 = st.sidebar.columns(2)
+    col1, col2, col3 = st.sidebar.columns(3)
     with col1:
         simulate_button = st.button("Simulate", type="primary", use_container_width=True)
     with col2:
         reset_button = st.button("Reset", type="secondary", use_container_width=True)
+    with col3:
+        if st.button("Train Model", use_container_width=True):
+            st.sidebar.info("Training slippage prediction model...")
+            
+            # Create a progress bar
+            progress_bar = st.sidebar.progress(0)
+            
+            # Initialize data collector
+            collector = SlippageDataCollector()
+            
+            # Check if we have enough data
+            try:
+                X, y = collector.get_training_data()
+                
+                # Update progress
+                progress_bar.progress(30)
+                
+                # Initialize and train model
+                model = SlippageModel()
+                training_result = model.train(X, y)
+                
+                # Update progress
+                progress_bar.progress(100)
+                
+                # Show training results
+                st.sidebar.success(f"Model trained successfully with {training_result['samples_count']} samples")
+                st.sidebar.info(f"R² Score: {training_result['linear_r2_score']:.4f}")
+            except ValueError as e:
+                st.sidebar.error(f"Error training model: {str(e)}")
+                st.sidebar.info("Collecting more data from order executions...")
+            finally:
+                # Remove progress bar
+                progress_bar.empty()
     
     # Initialize session state for storing simulation results
     if 'simulation_results' not in st.session_state:
@@ -466,26 +557,84 @@ def main():
         # Record the start time
         start_time = time.time()
         
-        # Run the simulation
-        expected_result = simulate_market_order(
-            order_book,
-            order_side.lower(),
-            quantity_usd,
-            price_impact_factor
+        # Calculate market depth for Almgren-Chriss model
+        bids = order_book.get_bids(10)
+        asks = order_book.get_asks(10)
+        
+        bid_depth = sum(qty for _, qty in bids)
+        ask_depth = sum(qty for _, qty in asks)
+        
+        total_depth = bid_depth + ask_depth
+        
+        # Calculate Almgren-Chriss impact
+        ac_impact = calculate_almgren_chriss_impact(
+            quantity_usd, 
+            total_depth,
+            volatility,
+            order_side.lower()
         )
         
-        # Calculate expected metrics
-        expected_metrics = calculate_order_metrics(expected_result, fee_percentage)
+        # Calculate Square Root impact (for comparison)
+        sq_impact = np.sqrt(quantity_usd / (total_depth * (best_bid[0] if best_bid else 1))) * volatility * 100
+        if order_side.lower() == "sell":
+            sq_impact = -sq_impact
         
-        # Simulate execution delay
-        if execution_delay > 0:
-            time.sleep(execution_delay / 1000)  # Convert ms to seconds
+        # Run the simulation based on the selected method
+        if use_ml_model:
+            # Use ML-based prediction
+            actual_result = simulate_market_order_with_ml(
+                order_book,
+                order_side.lower(),
+                quantity_usd,
+                volatility,
+                fee_percentage,
+                risk_level_code
+            )
+            
+            # For ML model, expected and actual are the same since this is a prediction
+            expected_metrics = actual_result
+        else:
+            # Run the standard simulation
+            expected_result = simulate_market_order(
+                order_book,
+                order_side.lower(),
+                quantity_usd,
+                price_impact_factor
+            )
+            
+            # Calculate expected metrics
+            expected_metrics = calculate_order_metrics(expected_result, fee_percentage)
+            
+            # Simulate execution delay
+            if execution_delay > 0:
+                time.sleep(execution_delay / 1000)  # Convert ms to seconds
+            
+            # Apply volatility to get the "actual" results
+            actual_result = apply_volatility(expected_result, volatility)
+            
+            # Calculate actual metrics
+            actual_metrics = calculate_order_metrics(actual_result, fee_percentage)
+            
+            # Save the execution data for ML training
+            try:
+                data_collector = SlippageDataCollector()
+                data_collector.add_execution_data(
+                    order_result=actual_metrics,
+                    order_book=order_book,
+                    volatility=volatility
+                )
+                logging.info(f"Saved execution data for ML training, current records: {len(data_collector.data)}")
+            except Exception as e:
+                logging.error(f"Error saving execution data: {e}")
         
-        # Apply volatility to get the "actual" results
-        actual_result = apply_volatility(expected_result, volatility)
-        
-        # Calculate actual metrics
-        actual_metrics = calculate_order_metrics(actual_result, fee_percentage)
+        # If using ML model, set actual_metrics to be the same as the prediction
+        if use_ml_model:
+            actual_metrics = actual_result
+            
+            # Add simulation metadata
+            actual_metrics["execution_time_ms"] = 0
+            actual_metrics["levels_walked"] = 0
+            actual_metrics["execution_detail"] = []
         
         # Calculate internal latency
         end_time = time.time()
@@ -495,12 +644,18 @@ def main():
         actual_metrics["internal_latency_ms"] = internal_latency
         actual_metrics["external_latency_ms"] = execution_delay
         
+        # Add impact model metrics
+        actual_metrics["ac_impact_pct"] = ac_impact
+        actual_metrics["sq_impact_pct"] = sq_impact
+        actual_metrics["selected_impact_model"] = impact_model
+        
         # Store simulation results in session state
         st.session_state.simulation_results = {
             "expected": expected_metrics,
             "actual": actual_metrics,
             "order_book": order_book,
-            "market": market
+            "market": market,
+            "model_type": "ml" if use_ml_model else "simulation"
         }
         
         # Update the order book visualization with executed levels
@@ -524,7 +679,10 @@ def main():
         with results_placeholder.container():
             if actual_metrics["success"]:
                 # Success message
-                st.success(f"Order simulation completed successfully.")
+                if use_ml_model:
+                    st.success(f"ML-based slippage prediction completed successfully.")
+                else:
+                    st.success(f"Order simulation completed successfully.")
                 
                 # Results container
                 results_container = st.container()
@@ -536,40 +694,127 @@ def main():
                 col1, col2 = st.columns(2)
                 
                 with col1:
-                    st.markdown("**Expected Values**")
-                    st.metric(label="Expected Price", value=format_currency(expected_metrics["avg_execution_price"]))
-                    st.metric(label="Expected Slippage", value=format_percentage(expected_metrics["slippage_pct"]))
-                    st.metric(label="Expected Fee", value=format_currency(expected_metrics["fee_usd"]))
-                    st.metric(label="Expected Impact", value=format_currency(expected_metrics["slippage_usd"]))
-                    st.metric(label="Expected Net Cost", value=format_currency(expected_metrics["total_cost"]))
+                    if use_ml_model:
+                        st.markdown("**ML Prediction Details**")
+                        st.metric(label="Predicted Price", value=format_currency(actual_metrics["avg_execution_price"]))
+                        st.metric(label="Predicted Slippage", value=format_percentage(actual_metrics["slippage_pct"]))
+                        st.metric(label="Trading Fee", value=format_currency(actual_metrics["fee_usd"]))
+                        st.metric(label="Total Cost", value=format_currency(actual_metrics["total_cost"]))
+                        st.metric(label="Risk Level", value=actual_metrics.get("risk_level", "Default"))
+                        
+                        # Maker/Taker information
+                        st.metric(label="Taker Proportion", value=f"{actual_metrics.get('taker_proportion', 1.0)*100:.0f}%")
+                        
+                        # If prediction contains quantile information, show it
+                        if "prediction" in actual_metrics and "all_predictions" in actual_metrics["prediction"]:
+                            st.markdown("**Prediction Ranges**")
+                            predictions = actual_metrics["prediction"]["all_predictions"]
+                            for q_name, q_value in predictions.items():
+                                if q_name != risk_level_code:  # Skip the currently selected one
+                                    st.metric(label=f"Slippage ({q_name})", value=format_percentage(q_value/100))
+                    else:
+                        st.markdown("**Expected Values**")
+                        st.metric(label="Expected Price", value=format_currency(expected_metrics["avg_execution_price"]))
+                        st.metric(label="Expected Slippage", value=format_percentage(expected_metrics["slippage_pct"]))
+                        st.metric(label="Expected Fee", value=format_currency(expected_metrics["fee_usd"]))
+                        st.metric(label="Expected Impact", value=format_currency(expected_metrics["slippage_usd"]))
+                        st.metric(label="Expected Net Cost", value=format_currency(expected_metrics["total_cost"]))
+                        
+                        # Maker/Taker information
+                        st.metric(label="Taker Proportion", value=f"{expected_metrics.get('taker_proportion', 1.0)*100:.0f}%")
                 
                 with col2:
-                    st.markdown("**Actual Values**")
+                    if use_ml_model:
+                        st.markdown("**Order Details**")
+                        st.metric(label="Market", value=market)
+                        st.metric(label="Side", value=order_side)
+                        st.metric(label="Quantity USD", value=format_currency(quantity_usd))
+                        st.metric(label="Executed Quantity", value=f"{actual_metrics['executed_quantity']:.6f}")
+                        st.metric(label="Fee Percentage", value=f"{fee_percentage*100:.2f}%")
+                        
+                        # Display weighted fee if available
+                        if "weighted_fee_pct" in actual_metrics:
+                            weighted_fee = actual_metrics["weighted_fee_pct"] * 100
+                            st.metric(label="Weighted Fee", value=f"{weighted_fee:.2f}%")
+                    else:
+                        st.markdown("**Actual Values**")
+                        st.metric(
+                            label="Actual Price",
+                            value=format_currency(actual_metrics["avg_execution_price"]),
+                            delta=format_currency(actual_metrics["avg_execution_price"] - expected_metrics["avg_execution_price"])
+                        )
+                        st.metric(
+                            label="Actual Slippage",
+                            value=format_percentage(actual_metrics["slippage_pct"]),
+                            delta=format_percentage(actual_metrics["slippage_pct"] - expected_metrics["slippage_pct"])
+                        )
+                        st.metric(
+                            label="Trading Fee",
+                            value=format_currency(actual_metrics["fee_usd"]),
+                            delta=format_currency(actual_metrics["fee_usd"] - expected_metrics["fee_usd"])
+                        )
+                        st.metric(
+                            label="Market Impact",
+                            value=format_currency(actual_metrics["slippage_usd"]),
+                            delta=format_currency(actual_metrics["slippage_usd"] - expected_metrics["slippage_usd"])
+                        )
+                        st.metric(
+                            label="Net Cost",
+                            value=format_currency(actual_metrics["total_cost"]),
+                            delta=format_currency(actual_metrics["total_cost"] - expected_metrics["total_cost"])
+                        )
+                        
+                        # Maker/Taker information
+                        st.metric(label="Taker Proportion", value=f"{actual_metrics.get('taker_proportion', 1.0)*100:.0f}%")
+                        
+                        # Display weighted fee if available
+                        if "weighted_fee_pct" in actual_metrics:
+                            weighted_fee = actual_metrics["weighted_fee_pct"] * 100
+                            st.metric(label="Weighted Fee", value=f"{weighted_fee:.2f}%")
+                
+                # Add Impact Model Comparison
+                st.markdown("### Impact Model Comparison")
+                impact_cols = st.columns(3)
+                with impact_cols[0]:
                     st.metric(
-                        label="Actual Price",
-                        value=format_currency(actual_metrics["avg_execution_price"]),
-                        delta=format_currency(actual_metrics["avg_execution_price"] - expected_metrics["avg_execution_price"])
-                    )
-                    st.metric(
-                        label="Actual Slippage",
+                        label="Standard Impact", 
                         value=format_percentage(actual_metrics["slippage_pct"]),
-                        delta=format_percentage(actual_metrics["slippage_pct"] - expected_metrics["slippage_pct"])
+                        help="Impact calculated from actual price movement"
                     )
+                with impact_cols[1]:
                     st.metric(
-                        label="Trading Fee",
-                        value=format_currency(actual_metrics["fee_usd"]),
-                        delta=format_currency(actual_metrics["fee_usd"] - expected_metrics["fee_usd"])
+                        label="Almgren-Chriss Impact", 
+                        value=format_percentage(actual_metrics["ac_impact_pct"]),
+                        delta=format_percentage(actual_metrics["ac_impact_pct"] - actual_metrics["slippage_pct"]),
+                        help="Impact estimated using Almgren-Chriss model"
                     )
+                with impact_cols[2]:
                     st.metric(
-                        label="Market Impact",
-                        value=format_currency(actual_metrics["slippage_usd"]),
-                        delta=format_currency(actual_metrics["slippage_usd"] - expected_metrics["slippage_usd"])
+                        label="Square Root Impact", 
+                        value=format_percentage(actual_metrics["sq_impact_pct"]),
+                        delta=format_percentage(actual_metrics["sq_impact_pct"] - actual_metrics["slippage_pct"]),
+                        help="Impact estimated using Square Root model"
                     )
-                    st.metric(
-                        label="Net Cost",
-                        value=format_currency(actual_metrics["total_cost"]),
-                        delta=format_currency(actual_metrics["total_cost"] - expected_metrics["total_cost"])
-                    )
+                
+                # Add visual comparison of impact models
+                impact_data = pd.DataFrame({
+                    'Model': ['Actual', 'Almgren-Chriss', 'Square Root'],
+                    'Impact (%)': [
+                        actual_metrics["slippage_pct"],
+                        actual_metrics["ac_impact_pct"],
+                        actual_metrics["sq_impact_pct"]
+                    ]
+                })
+                
+                impact_fig = px.bar(
+                    impact_data, 
+                    x='Model', 
+                    y='Impact (%)',
+                    title='Market Impact Model Comparison',
+                    color='Model',
+                    height=300
+                )
+                st.plotly_chart(impact_fig, use_container_width=True)
                 
                 # Latency information
                 st.markdown("### Performance Metrics")
@@ -587,6 +832,84 @@ def main():
                     st.markdown(f"- Side: {order_side}")
                     st.markdown(f"- Quantity: ${quantity_usd:.2f}")
                     st.markdown(f"- Fee Tier: {fee_tier}")
+                    st.markdown(f"- Selected Impact Model: {impact_model}")
+                    
+                    # Maker/Taker information
+                    st.markdown(f"**Maker/Taker Classification**")
+                    maker_proportion = actual_metrics.get("maker_proportion", 0.0)
+                    taker_proportion = actual_metrics.get("taker_proportion", 1.0)
+                    st.markdown(f"- Maker Proportion: {maker_proportion*100:.1f}%")
+                    st.markdown(f"- Taker Proportion: {taker_proportion*100:.1f}%")
+                    st.markdown(f"- Classification Method: {actual_metrics.get('prediction_method', 'rule-based')}")
+                    
+                    # Display maker/taker proportions as pie chart
+                    maker_taker_data = pd.DataFrame({
+                        'Type': ['Maker', 'Taker'],
+                        'Proportion': [maker_proportion, taker_proportion]
+                    })
+                    
+                    maker_taker_fig = px.pie(
+                        maker_taker_data, 
+                        values='Proportion', 
+                        names='Type',
+                        title='Maker/Taker Proportions',
+                        color='Type',
+                        color_discrete_map={'Maker': 'blue', 'Taker': 'red'}
+                    )
+                    st.plotly_chart(maker_taker_fig, use_container_width=True)
+                    
+                    if "weighted_fee_pct" in actual_metrics:
+                        weighted_fee = actual_metrics["weighted_fee_pct"] * 100
+                        st.markdown(f"- Weighted Fee Rate: {weighted_fee:.4f}%")
+                        standard_fee = fee_percentage * 100
+                        fee_savings = standard_fee - weighted_fee
+                        if fee_savings > 0:
+                            st.markdown(f"- Potential Fee Savings: {fee_savings:.4f}%")
+                    
+                    # Regression vs Actual Slippage Comparison
+                    if use_ml_model and "prediction" in actual_metrics:
+                        st.markdown("**Regression Model Performance**")
+                        
+                        # Create a comparison table
+                        pred = actual_metrics["prediction"]
+                        
+                        if "all_predictions" in pred:
+                            predictions = pred["all_predictions"]
+                            st.markdown(f"- Predicted Slippage (Selected): {format_percentage(actual_metrics['slippage_pct'])}")
+                            
+                            # Create dataframe for visualization
+                            pred_data = []
+                            for q_name, q_value in predictions.items():
+                                pred_data.append({
+                                    'Model': f"{q_name}",
+                                    'Predicted Slippage (%)': q_value/100
+                                })
+                            
+                            pred_df = pd.DataFrame(pred_data)
+                            
+                            # Sort by predicted slippage
+                            pred_df = pred_df.sort_values('Predicted Slippage (%)', ascending=False)
+                            
+                            # Display table
+                            st.dataframe(pred_df, use_container_width=True)
+                            
+                            # Bar chart of predictions
+                            pred_fig = px.bar(
+                                pred_df,
+                                x='Model',
+                                y='Predicted Slippage (%)', 
+                                title='Slippage Predictions by Model',
+                                height=300
+                            )
+                            
+                            pred_fig.add_hline(
+                                y=actual_metrics['slippage_pct'], 
+                                line_dash="dash", 
+                                line_color="red",
+                                annotation_text=f"Selected ({risk_level_code})"
+                            )
+                            
+                            st.plotly_chart(pred_fig, use_container_width=True)
                     
                     # Execution details
                     st.markdown(f"**Execution Details**")
