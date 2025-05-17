@@ -26,6 +26,13 @@ import math
 import numpy as np
 from orderbook import OrderBook
 
+# Check if calibration module exists
+try:
+    from almgren_chriss_calibration import AlmgrenChrissCalibrator
+    CALIBRATION_AVAILABLE = True
+except ImportError:
+    CALIBRATION_AVAILABLE = False
+
 
 def calculate_market_depth(order_book: OrderBook, depth_levels: int = 5) -> Dict[str, float]:
     """
@@ -167,7 +174,8 @@ def calculate_almgren_chriss_impact(
     quantity: float, 
     volatility: float,
     market_resilience: float = 0.1,
-    market_cap: Optional[float] = None
+    market_cap: Optional[float] = None,
+    use_calibration: bool = True
 ) -> Dict[str, Any]:
     """
     Calculate market impact using Almgren-Chriss model.
@@ -185,6 +193,7 @@ def calculate_almgren_chriss_impact(
     - volatility: Market volatility factor (annualized, e.g., 0.3 for 30%)
     - market_resilience: How quickly the market recovers (0-1)
     - market_cap: Optional market capitalization for scaling
+    - use_calibration: Whether to use calibrated parameters if available
     
     Returns:
     - Dictionary with impact components and parameters
@@ -195,11 +204,29 @@ def calculate_almgren_chriss_impact(
     # Get mid price
     mid_price = depth["mid_price"]
     
+    # Get calibrated parameters if available and requested
+    calibration_params = {}
+    if use_calibration and CALIBRATION_AVAILABLE:
+        try:
+            calibrator = AlmgrenChrissCalibrator()
+            calibration_params = calibrator.get_market_parameters(order_book.symbol, volatility)
+        except Exception as e:
+            print(f"Error getting calibrated parameters: {e}")
+    
     # Estimate temporary impact factor (gamma)
     gamma = estimate_temporary_impact(depth, volatility, market_cap)
     
     # Estimate permanent impact factor (eta)
     eta = estimate_permanent_impact(depth, market_resilience)
+    
+    # Apply calibration scaling if available
+    if calibration_params:
+        gamma_scale = calibration_params.get('gamma_scale', 1.0)
+        eta_scale = calibration_params.get('eta_scale', 1.0)
+        volatility_adjustment = calibration_params.get('volatility_adjustment', 1.0)
+        
+        gamma *= gamma_scale * volatility_adjustment
+        eta *= eta_scale
     
     # Calculate impacts
     # For sell orders, impact is negative (price decreases)
@@ -236,7 +263,8 @@ def calculate_almgren_chriss_impact(
         "side": side,
         "quantity": quantity,
         "volatility": volatility,
-        "market_resilience": market_resilience
+        "market_resilience": market_resilience,
+        "calibrated": bool(calibration_params) if use_calibration and CALIBRATION_AVAILABLE else False
     }
 
 
@@ -247,7 +275,8 @@ def simulate_market_order_with_impact(
     volatility: float,
     market_resilience: float = 0.1,
     market_cap: Optional[float] = None,
-    fee_percentage: float = 0.001
+    fee_percentage: float = 0.001,
+    use_calibration: bool = True
 ) -> Dict[str, Any]:
     """
     Simulate a market order execution with Almgren-Chriss impact model.
@@ -260,6 +289,7 @@ def simulate_market_order_with_impact(
         market_resilience: Market recovery rate (0-1)
         market_cap: Optional market capitalization
         fee_percentage: Trading fee percentage
+        use_calibration: Whether to use calibrated parameters
         
     Returns:
         Dictionary with execution details including impact metrics
@@ -291,7 +321,8 @@ def simulate_market_order_with_impact(
         estimated_quantity, 
         volatility,
         market_resilience,
-        market_cap
+        market_cap,
+        use_calibration
     )
     
     # Adjust price based on impact
@@ -322,6 +353,7 @@ def simulate_market_order_with_impact(
         "total_cost": total_cost + fee_usd if side.lower() == 'buy' else total_cost - fee_usd,
         "is_complete": True,
         "impact_model": "almgren_chriss",
+        "calibrated": impact_result.get("calibrated", False),
         "impact_metrics": impact_result
     }
     

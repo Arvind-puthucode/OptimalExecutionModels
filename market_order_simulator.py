@@ -3,6 +3,12 @@ import time
 import numpy as np
 from orderbook import OrderBook
 from regression_models import SlippageModel, simulate_market_order_with_prediction
+# Import the enhanced regression models
+try:
+    from enhanced_regression_models import EnhancedSlippageModel, TimeSeriesSlippageModel, simulate_market_order_with_enhanced_ml
+    ENHANCED_MODELS_AVAILABLE = True
+except ImportError:
+    ENHANCED_MODELS_AVAILABLE = False
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
@@ -412,46 +418,52 @@ def simulate_market_order_with_ml(
     risk_level: str = 'q50'
 ) -> Dict[str, Any]:
     """
-    Simulate a market order using ML-based slippage prediction.
+    Simulate a market order execution using machine learning for slippage prediction.
     
     Args:
         order_book: The current order book state
-        side: 'buy' or 'sell'
+        side: 'buy' or 'sell' 
         quantity_usd: Amount in USD to trade
-        volatility: Current market volatility measure
-        fee_percentage: Fee percentage for the order
-        risk_level: Risk level for prediction ('mean', 'q10', 'q25', 'q50', 'q75', 'q90')
-        
+        volatility: Market volatility
+        fee_percentage: Trading fee percentage
+        risk_level: Risk level for prediction (q10, q25, q50, q75, q90, mean)
+    
     Returns:
-        Dictionary with execution details including predicted slippage
+        Dictionary with execution details including predicted average price and slippage
     """
-    # Initialize the slippage prediction model
-    slippage_model = SlippageModel()
+    # First try to use enhanced models if available
+    if ENHANCED_MODELS_AVAILABLE:
+        try:
+            # Check if the enhanced model exists and has data
+            enhanced_model = EnhancedSlippageModel()
+            if enhanced_model.linear_model is not None:
+                # If the enhanced model is available, use it with the default "linear" model
+                # The other enhanced functions will be called through the app.py when desired
+                return simulate_market_order_with_enhanced_ml(
+                    order_book,
+                    side,
+                    quantity_usd,
+                    volatility,
+                    fee_percentage,
+                    "linear",  # Default to linear model
+                    risk_level
+                )
+        except Exception as e:
+            # If enhanced model fails, fall back to standard prediction
+            print(f"Enhanced model failed, falling back to standard model: {e}")
+            pass
     
-    # If model file doesn't exist yet, return to standard simulation
-    if not slippage_model.linear_model:
-        result = simulate_market_order(order_book, side, quantity_usd)
-        return calculate_order_metrics(result, fee_percentage)
-    
-    # Use the regression model to simulate the order with predicted slippage
-    result = simulate_market_order_with_prediction(
-        order_book=order_book,
-        side=side,
-        quantity_usd=quantity_usd,
-        volatility=volatility,
-        slippage_model=slippage_model,
-        risk_level=risk_level,
-        fee_percentage=fee_percentage
+    # Fall back to standard model
+    model = SlippageModel()
+    return simulate_market_order_with_prediction(
+        order_book,
+        side,
+        quantity_usd,
+        volatility,
+        model,
+        risk_level,
+        fee_percentage
     )
-    
-    # Add maker/taker classification (market orders are always 100% taker)
-    maker_taker_classifier = MakerTakerClassifier()
-    maker_taker_info = maker_taker_classifier.predict_maker_taker('market', 0, order_book, quantity_usd, volatility)
-    
-    result["maker_proportion"] = maker_taker_info["maker_proportion"]
-    result["taker_proportion"] = maker_taker_info["taker_proportion"]
-    
-    return result
 
 
 # Example usage

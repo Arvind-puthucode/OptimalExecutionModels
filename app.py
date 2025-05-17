@@ -9,9 +9,21 @@ from orderbook import OrderBook
 from orderbook_client import OrderBookClient  # type: ignore
 from market_order_simulator import simulate_market_order, calculate_order_metrics, simulate_market_order_with_ml
 from regression_models import SlippageModel, SlippageDataCollector
+# Import our enhanced regression models
+from enhanced_regression_models import EnhancedSlippageModel, TimeSeriesSlippageModel, simulate_market_order_with_enhanced_ml
 import plotly.graph_objects as go
 import plotly.express as px
+from datetime import datetime
+import seaborn as sns
 
+# Import our new modules if available
+try:
+    from almgren_chriss import simulate_market_order_with_impact
+    from almgren_chriss_calibration import AlmgrenChrissCalibrator
+    from model_validation import ModelValidator
+    ALMGREN_CHRISS_AVAILABLE = True
+except ImportError:
+    ALMGREN_CHRISS_AVAILABLE = False
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -283,6 +295,803 @@ def calculate_almgren_chriss_impact(order_size_usd, market_depth, volatility, si
     return temporary_impact * 100  # Convert to percentage
 
 
+def plot_orderbook_heatmap(order_book, depth=20, normalize=True):
+    """
+    Create a heatmap visualization of the order book liquidity distribution.
+    
+    Args:
+        order_book: OrderBook instance
+        depth: Number of price levels to include
+        normalize: Whether to normalize the quantities for better visualization
+    
+    Returns:
+        Plotly figure
+    """
+    bids = order_book.get_bids(depth)
+    asks = order_book.get_asks(depth)
+    
+    # Create dataframes for bids and asks
+    bid_prices = [float(bid[0]) for bid in bids]
+    bid_quantities = [float(bid[1]) for bid in bids]
+    bid_depths = np.cumsum(bid_quantities)
+    
+    ask_prices = [float(ask[0]) for ask in asks]
+    ask_quantities = [float(ask[1]) for ask in asks]
+    ask_depths = np.cumsum(ask_quantities)
+    
+    # Create a single array for all price levels
+    all_prices = np.concatenate([np.array(bid_prices)[::-1], np.array(ask_prices)])
+    
+    # For normalized view
+    if normalize:
+        max_qty = max(max(bid_quantities), max(ask_quantities))
+        bid_intensity = np.array(bid_quantities) / max_qty
+        ask_intensity = np.array(ask_quantities) / max_qty
+    else:
+        bid_intensity = bid_quantities
+        ask_intensity = ask_quantities
+    
+    # Create the heatmap figure
+    fig = go.Figure()
+    
+    # Add bid heatmap (greens)
+    fig.add_trace(go.Heatmap(
+        z=[bid_intensity],
+        x=bid_prices,
+        y=['Bids'],
+        colorscale=[[0, 'rgba(0,50,0,0.2)'], [1, 'rgba(0,255,0,1)']],
+        showscale=False,
+        text=[[f"Price: {p}<br>Quantity: {q}<br>Depth: {d}" for p, q, d in zip(bid_prices, bid_quantities, bid_depths)]],
+        hoverinfo='text'
+    ))
+    
+    # Add ask heatmap (reds)
+    fig.add_trace(go.Heatmap(
+        z=[ask_intensity],
+        x=ask_prices,
+        y=['Asks'],
+        colorscale=[[0, 'rgba(50,0,0,0.2)'], [1, 'rgba(255,0,0,1)']],
+        showscale=False,
+        text=[[f"Price: {p}<br>Quantity: {q}<br>Depth: {d}" for p, q, d in zip(ask_prices, ask_quantities, ask_depths)]],
+        hoverinfo='text'
+    ))
+    
+    # Highlight the spread
+    if bids and asks:
+        best_bid = max(bid_prices)
+        best_ask = min(ask_prices)
+        spread = best_ask - best_bid
+        spread_pct = spread / best_bid * 100
+        
+        # Add spread marker
+        fig.add_shape(
+            type="rect",
+            x0=best_bid,
+            x1=best_ask,
+            y0=-0.5,
+            y1=1.5,
+            fillcolor="rgba(100,100,100,0.2)",
+            line=dict(color="gray", width=1, dash="dot"),
+            layer="below"
+        )
+
+    # Update layout
+    fig.update_layout(
+        title=f"Order Book Heatmap - Liquidity Distribution",
+        xaxis_title="Price",
+        yaxis=dict(
+            title="",
+            tickmode='array',
+            tickvals=[0, 1],
+            ticktext=['Bids', 'Asks']
+        ),
+        height=250,
+        margin=dict(l=50, r=50, t=80, b=50),
+        annotations=[
+            dict(
+                x=0.5,
+                y=-0.15,
+                showarrow=False,
+                text=f"Spread: {spread:.2f} ({spread_pct:.4f}%)" if 'spread' in locals() else "",
+                xref="paper",
+                yref="paper",
+                font=dict(size=12)
+            )
+        ]
+    )
+    
+    return fig
+
+
+def plot_order_walk_visualization(order_simulation, order_book, depth=20):
+    """
+    Visualize how a market order "walks the book" by highlighting the filled price levels.
+    
+    Args:
+        order_simulation: Result from simulate_market_order function
+        order_book: OrderBook instance
+        depth: Number of price levels to show
+    
+    Returns:
+        Plotly figure
+    """
+    if not order_simulation["success"]:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Order simulation failed - insufficient liquidity",
+            showarrow=False,
+            font=dict(size=15, color="red"),
+            xref="paper", yref="paper",
+            x=0.5, y=0.5
+        )
+        fig.update_layout(height=400)
+        return fig
+    
+    side = order_simulation["side"]
+    execution_details = order_simulation["execution_detail"]
+    
+    # Get data from order book
+    bids = order_book.get_bids(depth)
+    asks = order_book.get_asks(depth)
+    
+    # Create price level arrays
+    bid_prices = [float(bid[0]) for bid in bids]
+    bid_quantities = [float(bid[1]) for bid in bids]
+    
+    ask_prices = [float(ask[0]) for ask in asks]
+    ask_quantities = [float(ask[1]) for ask in asks]
+    
+    # Create execution price and qty arrays
+    exec_prices = [level["price"] for level in execution_details]
+    exec_quantities = [level["quantity"] for level in execution_details]
+    exec_values = [level["price"] * level["quantity"] for level in execution_details]
+    
+    # Determine cumulative volume and percentage of order filled at each price
+    cumulative_qty = np.cumsum(exec_quantities)
+    total_qty = sum(exec_quantities)
+    pct_filled = (cumulative_qty / total_qty * 100) if total_qty > 0 else [0]
+    
+    # Create figure
+    fig = go.Figure()
+    
+    # Add bars for the original order book
+    if side.lower() == "buy":
+        # For buys we filled ask side
+        fig.add_trace(go.Bar(
+            x=ask_prices,
+            y=ask_quantities,
+            name="Ask Liquidity",
+            marker_color="rgba(255, 0, 0, 0.3)",
+            hoverinfo="text",
+            hovertext=[f"Price: {p}<br>Quantity: {q}" for p, q in zip(ask_prices, ask_quantities)]
+        ))
+        
+        # Add execution bars
+        fig.add_trace(go.Bar(
+            x=exec_prices,
+            y=exec_quantities,
+            name="Executed",
+            marker_color="rgba(255, 165, 0, 0.9)",
+            hoverinfo="text",
+            hovertext=[f"Price: {p}<br>Quantity: {q}<br>Value: ${v:.2f}<br>Filled: {pct:.1f}%" 
+                     for p, q, v, pct in zip(exec_prices, exec_quantities, exec_values, pct_filled)]
+        ))
+    else:
+        # For sells we filled bid side
+        fig.add_trace(go.Bar(
+            x=bid_prices,
+            y=bid_quantities,
+            name="Bid Liquidity",
+            marker_color="rgba(0, 128, 0, 0.3)",
+            hoverinfo="text",
+            hovertext=[f"Price: {p}<br>Quantity: {q}" for p, q in zip(bid_prices, bid_quantities)]
+        ))
+        
+        # Add execution bars
+        fig.add_trace(go.Bar(
+            x=exec_prices,
+            y=exec_quantities,
+            name="Executed",
+            marker_color="rgba(0, 191, 255, 0.9)",
+            hoverinfo="text",
+            hovertext=[f"Price: {p}<br>Quantity: {q}<br>Value: ${v:.2f}<br>Filled: {pct:.1f}%" 
+                     for p, q, v, pct in zip(exec_prices, exec_quantities, exec_values, pct_filled)]
+        ))
+    
+    # Add price distribution line
+    fig.add_trace(go.Scatter(
+        x=exec_prices,
+        y=pct_filled,
+        mode="lines+markers",
+        name="% Order Filled",
+        line=dict(color="black", width=2),
+        marker=dict(size=8, color="purple"),
+        yaxis="y2"
+    ))
+    
+    # Update layout
+    fig.update_layout(
+        title=f"{side.capitalize()} Order Execution - Walking the Book",
+        xaxis_title="Price",
+        yaxis=dict(
+            title="Quantity",
+            side="left"
+        ),
+        yaxis2=dict(
+            title="% of Order Filled",
+            side="right",
+            overlaying="y",
+            range=[0, 100],
+            ticksuffix="%"
+        ),
+        legend=dict(x=0.01, y=0.99, orientation="h"),
+        height=400
+    )
+    
+    # Add a vertical line at the average execution price
+    avg_price = order_simulation["avg_execution_price"]
+    fig.add_shape(
+        type="line",
+        x0=avg_price,
+        x1=avg_price,
+        y0=0,
+        y1=1,
+        yref="paper",
+        line=dict(color="red", width=2, dash="dash"),
+    )
+    
+    # Add annotation for average price
+    fig.add_annotation(
+        x=avg_price,
+        y=1,
+        yref="paper",
+        text=f"Avg Price: {avg_price:.2f}",
+        showarrow=True,
+        arrowhead=1,
+        ax=0,
+        ay=-40
+    )
+    
+    return fig
+
+
+def create_execution_quality_dashboard(execution_history):
+    """
+    Create a comprehensive execution quality dashboard
+    
+    Args:
+        execution_history: DataFrame with historical execution data
+    
+    Returns:
+        List of plotly figures
+    """
+    if execution_history is None or execution_history.empty:
+        return [go.Figure().update_layout(
+            title="No execution history available",
+            annotations=[dict(
+                text="Execute some orders to see performance metrics",
+                showarrow=False,
+                xref="paper", yref="paper",
+                x=0.5, y=0.5
+            )]
+        )]
+    
+    figures = []
+    
+    # 1. Slippage over time
+    slippage_fig = px.line(
+        execution_history, 
+        x='timestamp', 
+        y='slippage_bps',
+        color='side',
+        labels={'slippage_bps': 'Slippage (bps)', 'timestamp': 'Time'},
+        title='Slippage Over Time',
+        hover_data=['quantity_usd', 'avg_execution_price']
+    )
+    
+    # Add a horizontal line at y=0 for reference
+    slippage_fig.add_shape(
+        type="line",
+        x0=0,
+        x1=1,
+        y0=0,
+        y1=0,
+        xref="paper",
+        line=dict(color="gray", width=1, dash="dash")
+    )
+    
+    # Calculate and display average slippage
+    avg_slippage = execution_history['slippage_bps'].mean()
+    slippage_fig.add_annotation(
+        x=0.98,
+        y=0.03,
+        xref="paper",
+        yref="paper",
+        text=f"Avg Slippage: {avg_slippage:.2f} bps",
+        showarrow=False,
+        font=dict(color="black", size=12),
+        bgcolor="rgba(255,255,255,0.8)",
+        bordercolor="gray",
+        borderwidth=1
+    )
+    
+    # Update layout
+    slippage_fig.update_layout(
+        height=300,
+        margin=dict(l=50, r=50, t=80, b=50),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    
+    figures.append(slippage_fig)
+    
+    # 2. Slippage distribution histogram
+    hist_fig = px.histogram(
+        execution_history,
+        x='slippage_bps',
+        color='side',
+        marginal='violin',
+        nbins=20,
+        title='Slippage Distribution',
+        labels={'slippage_bps': 'Slippage (bps)'}
+    )
+    
+    # Add vertical line at mean
+    hist_fig.add_vline(
+        x=avg_slippage,
+        line_dash="dash",
+        line_color="black",
+        annotation_text=f"Mean: {avg_slippage:.2f}",
+        annotation_position="top right"
+    )
+    
+    # Add vertical line at 0
+    hist_fig.add_vline(
+        x=0,
+        line_dash="solid",
+        line_color="gray"
+    )
+    
+    # Update layout
+    hist_fig.update_layout(
+        height=300,
+        margin=dict(l=50, r=50, t=80, b=50),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    
+    figures.append(hist_fig)
+    
+    # 3. Slippage vs Order Size scatter plot
+    scatter_fig = px.scatter(
+        execution_history,
+        x='quantity_usd',
+        y='slippage_bps',
+        color='side',
+        size='order_pct_of_depth',
+        hover_data=['timestamp', 'avg_execution_price'],
+        title='Slippage vs Order Size',
+        labels={
+            'quantity_usd': 'Order Size (USD)',
+            'slippage_bps': 'Slippage (bps)',
+            'order_pct_of_depth': '% of Book Depth'
+        },
+        trendline='ols'
+    )
+    
+    # Add horizontal line at y=0
+    scatter_fig.add_shape(
+        type="line",
+        x0=0,
+        x1=1,
+        y0=0,
+        y1=0,
+        xref="paper",
+        line=dict(color="gray", width=1, dash="dash")
+    )
+    
+    # Update layout
+    scatter_fig.update_layout(
+        height=300,
+        margin=dict(l=50, r=50, t=80, b=50),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    
+    figures.append(scatter_fig)
+    
+    # 4. Model accuracy metrics if predictions are available
+    if 'predicted_slippage_bps' in execution_history.columns:
+        # Create prediction error field
+        execution_history['prediction_error'] = execution_history['slippage_bps'] - execution_history['predicted_slippage_bps']
+        
+        # RMSE and MAE
+        from sklearn.metrics import mean_squared_error, mean_absolute_error
+        rmse = np.sqrt(mean_squared_error(execution_history['slippage_bps'], execution_history['predicted_slippage_bps']))
+        mae = mean_absolute_error(execution_history['slippage_bps'], execution_history['predicted_slippage_bps'])
+        
+        # Create scatter plot of actual vs predicted
+        pred_fig = px.scatter(
+            execution_history,
+            x='slippage_bps',
+            y='predicted_slippage_bps',
+            color='side', 
+            hover_data=['timestamp', 'quantity_usd'],
+            title=f'Model Accuracy - Actual vs Predicted Slippage (RMSE: {rmse:.2f}, MAE: {mae:.2f})',
+            labels={
+                'slippage_bps': 'Actual Slippage (bps)',
+                'predicted_slippage_bps': 'Predicted Slippage (bps)'
+            }
+        )
+        
+        # Add 45-degree line (perfect predictions)
+        min_val = min(execution_history['slippage_bps'].min(), execution_history['predicted_slippage_bps'].min())
+        max_val = max(execution_history['slippage_bps'].max(), execution_history['predicted_slippage_bps'].max())
+        
+        pred_fig.add_trace(go.Scatter(
+            x=[min_val, max_val],
+            y=[min_val, max_val],
+            mode='lines',
+            line=dict(color='gray', dash='dash'),
+            name='Perfect Prediction'
+        ))
+        
+        # Update layout
+        pred_fig.update_layout(
+            height=350,
+            margin=dict(l=50, r=50, t=80, b=50),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        
+        figures.append(pred_fig)
+        
+        # 5. Prediction error over time
+        error_fig = px.line(
+            execution_history.sort_values('timestamp'),
+            x='timestamp',
+            y='prediction_error',
+            color='side',
+            title='Prediction Error Over Time',
+            labels={
+                'prediction_error': 'Prediction Error (bps)',
+                'timestamp': 'Time'
+            }
+        )
+        
+        # Add a horizontal line at y=0 (no error)
+        error_fig.add_shape(
+            type="line",
+            x0=0,
+            x1=1,
+            y0=0,
+            y1=0,
+            xref="paper",
+            line=dict(color="gray", width=1, dash="dash")
+        )
+        
+        # Update layout
+        error_fig.update_layout(
+            height=300,
+            margin=dict(l=50, r=50, t=80, b=50),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        
+        figures.append(error_fig)
+    
+    return figures
+
+
+def create_scenario_analysis(order_book, scenarios):
+    """
+    Create a comparative visualization for different execution scenarios
+    
+    Args:
+        order_book: Current OrderBook instance
+        scenarios: List of scenario dictionaries with keys:
+                  - name: Scenario name
+                  - side: Buy or sell
+                  - quantity_usd: Order size in USD
+                  - simulation_result: Result from simulation function
+                  
+    Returns:
+        List of plotly figures for comparing scenarios
+    """
+    if not scenarios or len(scenarios) == 0:
+        return [go.Figure().update_layout(
+            title="No scenarios to compare",
+            height=300
+        )]
+    
+    figures = []
+    
+    # Prepare data for the comparison
+    scenario_names = [s['name'] for s in scenarios]
+    avg_prices = [s['simulation_result'].get('avg_execution_price', 0) for s in scenarios]
+    slippages = [s['simulation_result'].get('slippage_bps', 0) for s in scenarios]
+    quantities = [s['quantity_usd'] for s in scenarios]
+    fees = [s['simulation_result'].get('fee', 0) for s in scenarios]
+    total_costs = [s['simulation_result'].get('total_cost', 0) for s in scenarios]
+    sides = [s['side'] for s in scenarios]
+    
+    # 1. Basic comparison bar chart
+    comparison_df = pd.DataFrame({
+        'Scenario': scenario_names,
+        'Avg Price': avg_prices,
+        'Slippage (bps)': slippages,
+        'Order Size': quantities,
+        'Fee': fees,
+        'Total Cost': total_costs,
+        'Side': sides
+    })
+    
+    # Price comparison
+    price_fig = px.bar(
+        comparison_df,
+        x='Scenario',
+        y='Avg Price',
+        color='Side',
+        title='Average Execution Price by Scenario',
+        labels={'Avg Price': 'Average Price'},
+        hover_data=['Order Size', 'Slippage (bps)']
+    )
+    price_fig.update_layout(height=300)
+    figures.append(price_fig)
+    
+    # Slippage comparison
+    slippage_fig = px.bar(
+        comparison_df,
+        x='Scenario',
+        y='Slippage (bps)',
+        color='Side',
+        title='Slippage by Scenario',
+        labels={'Slippage (bps)': 'Slippage (bps)'},
+        hover_data=['Order Size', 'Avg Price']
+    )
+    
+    # Add a horizontal line at y=0
+    slippage_fig.add_shape(
+        type="line",
+        x0=-0.5,
+        x1=len(scenario_names) - 0.5,
+        y0=0,
+        y1=0,
+        line=dict(color="gray", width=1, dash="dash")
+    )
+    
+    slippage_fig.update_layout(height=300)
+    figures.append(slippage_fig)
+    
+    # 2. Execution details comparison (if available)
+    # Create a more detailed comparison of execution details across scenarios
+    execution_details = []
+    for scenario in scenarios:
+        if 'execution_detail' in scenario['simulation_result']:
+            for level in scenario['simulation_result']['execution_detail']:
+                execution_details.append({
+                    'Scenario': scenario['name'],
+                    'Side': scenario['side'],
+                    'Price': level['price'],
+                    'Quantity': level['quantity'],
+                    'Value': level['price'] * level['quantity'],
+                    'Order Size': scenario['quantity_usd']
+                })
+    
+    if execution_details:
+        execution_df = pd.DataFrame(execution_details)
+        
+        # Price levels filled per scenario
+        levels_fig = px.bar(
+            execution_df,
+            x='Price',
+            y='Quantity',
+            color='Scenario',
+            facet_col='Side',
+            title='Price Levels Filled by Scenario',
+            hover_data=['Value'],
+            barmode='group'
+        )
+        levels_fig.update_layout(height=400)
+        figures.append(levels_fig)
+        
+        # Cumulative execution by price level
+        cumulative_fig = px.bar(
+            execution_df,
+            x='Price',
+            y='Quantity',
+            color='Scenario',
+            facet_col='Side',
+            title='Cumulative Execution by Price Level',
+            hover_data=['Value'],
+            barmode='relative'
+        )
+        cumulative_fig.update_layout(height=400)
+        figures.append(cumulative_fig)
+    
+    # 3. Total cost comparison
+    cost_fig = px.bar(
+        comparison_df,
+        x='Scenario',
+        y='Total Cost',
+        color='Side',
+        title='Total Execution Cost by Scenario',
+        labels={'Total Cost': 'Total Cost (USD)'},
+        hover_data=['Order Size', 'Fee', 'Slippage (bps)']
+    )
+    
+    # Add cost breakdown as stacked bars if we have fee information
+    if all(fee > 0 for fee in fees):
+        # Create a stacked bar with market impact and fees
+        market_impact = [total - fee for total, fee in zip(total_costs, fees)]
+        
+        cost_breakdown = pd.DataFrame({
+            'Scenario': scenario_names + scenario_names,
+            'Cost Component': ['Market Impact'] * len(scenario_names) + ['Fees'] * len(scenario_names),
+            'Cost': market_impact + fees,
+            'Side': sides + sides
+        })
+        
+        cost_breakdown_fig = px.bar(
+            cost_breakdown,
+            x='Scenario',
+            y='Cost',
+            color='Cost Component',
+            title='Cost Breakdown by Scenario',
+            labels={'Cost': 'Cost (USD)'},
+            barmode='stack',
+            hover_data=['Side']
+        )
+        cost_breakdown_fig.update_layout(height=350)
+        figures.append(cost_breakdown_fig)
+    
+    cost_fig.update_layout(height=300)
+    figures.append(cost_fig)
+    
+    # 4. Percentage difference from best execution
+    if len(scenarios) > 1:
+        # Find the best (lowest) price for buys and the best (highest) price for sells
+        buy_scenarios = [s for s in scenarios if s['side'].lower() == 'buy']
+        sell_scenarios = [s for s in scenarios if s['side'].lower() == 'sell']
+        
+        comparison_df['Best Price Difference %'] = 0.0
+        
+        if buy_scenarios:
+            best_buy_price = min([s['simulation_result'].get('avg_execution_price', float('inf')) 
+                                for s in buy_scenarios if s['simulation_result'].get('success', False)])
+            
+            for i, scenario in enumerate(scenarios):
+                if scenario['side'].lower() == 'buy' and scenario['simulation_result'].get('success', False):
+                    price = scenario['simulation_result'].get('avg_execution_price', 0)
+                    if best_buy_price > 0:
+                        comparison_df.loc[i, 'Best Price Difference %'] = (price - best_buy_price) / best_buy_price * 100
+        
+        if sell_scenarios:
+            best_sell_price = max([s['simulation_result'].get('avg_execution_price', 0) 
+                                 for s in sell_scenarios if s['simulation_result'].get('success', False)])
+            
+            for i, scenario in enumerate(scenarios):
+                if scenario['side'].lower() == 'sell' and scenario['simulation_result'].get('success', False):
+                    price = scenario['simulation_result'].get('avg_execution_price', 0)
+                    if best_sell_price > 0:
+                        comparison_df.loc[i, 'Best Price Difference %'] = (best_sell_price - price) / best_sell_price * 100
+        
+        # Create the price difference chart
+        diff_fig = px.bar(
+            comparison_df,
+            x='Scenario',
+            y='Best Price Difference %',
+            color='Side',
+            title='Execution Price Difference from Best Scenario (%)',
+            labels={'Best Price Difference %': 'Difference from Best Price (%)'},
+            hover_data=['Avg Price', 'Order Size']
+        )
+        
+        diff_fig.update_layout(height=300)
+        figures.append(diff_fig)
+    
+    return figures
+
+# Function to update simulation with scenario parameters
+def run_scenario_simulation(order_book, side, quantity_usd, model_type, volatility=0.2, fee_percentage=0.001):
+    """Run a market order simulation with the specified parameters"""
+    if model_type == 'basic':
+        # Basic simulation without ML prediction
+        simulation_result = simulate_market_order(order_book, side, quantity_usd)
+        
+        # Calculate metrics
+        if simulation_result["success"]:
+            metrics = calculate_order_metrics(simulation_result, fee_percentage)
+            simulation_result.update(metrics)
+        
+    elif model_type == 'ml':
+        # ML-based simulation
+        simulation_result = simulate_market_order_with_ml(
+            order_book, side, quantity_usd, volatility, fee_percentage
+        )
+    
+    elif model_type == 'enhanced_ml' and 'ENHANCED_MODELS_AVAILABLE' in globals() and ENHANCED_MODELS_AVAILABLE:
+        # Enhanced ML simulation
+        simulation_result = simulate_market_order_with_enhanced_ml(
+            order_book, side, quantity_usd, volatility, fee_percentage
+        )
+    
+    elif model_type == 'almgren_chriss' and ALMGREN_CHRISS_AVAILABLE:
+        # Almgren-Chriss simulation
+        simulation_result = simulate_market_order_with_impact(
+            order_book, side, quantity_usd, volatility
+        )
+        
+        # Calculate metrics
+        if simulation_result["success"]:
+            metrics = calculate_order_metrics(simulation_result, fee_percentage)
+            simulation_result.update(metrics)
+    
+    else:
+        # Fallback to basic if model not available
+        simulation_result = simulate_market_order(order_book, side, quantity_usd)
+        
+        # Calculate metrics
+        if simulation_result["success"]:
+            metrics = calculate_order_metrics(simulation_result, fee_percentage)
+            simulation_result.update(metrics)
+    
+    return simulation_result
+
+def save_execution_to_history(simulation_result, side, quantity_usd, order_book):
+    """Save execution results to the history dataframe for dashboard analysis"""
+    if not simulation_result.get("success", False):
+        return
+    
+    # Get current time
+    timestamp = datetime.now()
+    
+    # Calculate order percentage of depth
+    side_depth = sum(qty for _, qty in order_book.get_asks(100)) if side.lower() == "buy" else sum(qty for _, qty in order_book.get_bids(100))
+    order_pct_of_depth = (quantity_usd / side_depth) * 100 if side_depth > 0 else 0
+    
+    # Calculate depth imbalance
+    bid_depth = sum(qty for _, qty in order_book.get_bids(20))
+    ask_depth = sum(qty for _, qty in order_book.get_asks(20))
+    total_depth = bid_depth + ask_depth
+    depth_imbalance = (bid_depth - ask_depth) / total_depth if total_depth > 0 else 0
+    
+    # Get spread in basis points
+    best_bid = order_book.get_best_bid()
+    best_ask = order_book.get_best_ask()
+    if best_bid and best_ask:
+        mid_price = (best_bid[0] + best_ask[0]) / 2
+        spread_bps = (best_ask[0] - best_bid[0]) / mid_price * 10000  # Convert to basis points
+    else:
+        spread_bps = 0
+    
+    # Create a new record
+    new_record = {
+        'timestamp': timestamp,
+        'symbol': order_book.symbol,
+        'side': side.lower(),
+        'quantity_usd': quantity_usd,
+        'order_pct_of_depth': order_pct_of_depth,
+        'spread_bps': spread_bps,
+        'volatility': simulation_result.get('volatility', 0.2),
+        'depth_imbalance': depth_imbalance,
+        'avg_execution_price': simulation_result.get('avg_execution_price', 0),
+        'slippage_bps': simulation_result.get('slippage_bps', 0),
+        'fee': simulation_result.get('fee', 0),
+        'total_cost': simulation_result.get('total_cost', 0)
+    }
+    
+    # Add predicted slippage if available
+    if 'predicted_slippage' in simulation_result:
+        new_record['predicted_slippage_bps'] = simulation_result['predicted_slippage']
+    
+    # Convert to DataFrame
+    record_df = pd.DataFrame([new_record])
+    
+    # Append to existing history
+    if 'execution_history' in st.session_state:
+        st.session_state.execution_history = pd.concat([st.session_state.execution_history, record_df])
+    else:
+        st.session_state.execution_history = record_df
+    
+    # Log
+    logging.info(f"Saved execution data for ML training, current records: {len(st.session_state.execution_history)}")
+
 def main():
     # Initialize connection to order book data
     connection_status = init_client()
@@ -354,145 +1163,459 @@ def main():
             logging.info(f"Session state connected: {st.session_state.connected}")
             logging.info(f"Order book state (client): {client.get_order_book_snapshot()}")
     
-    # Order parameters
-    quantity_usd = st.sidebar.number_input(
-        "Quantity (USD)",
-        min_value=10.0,
-        max_value=100000.0,
-        value=1000.0,
-        step=100.0,
-        help="Amount in USD to trade"
-    )
+    # Sidebar tabs
+    sidebar_tab1, sidebar_tab2, sidebar_tab3 = st.sidebar.tabs(["Simulation", "Model Validation", "Model Analysis"])
     
-    volatility = st.sidebar.slider(
-        "Market Volatility",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.2,
-        step=0.05,
-        help="Simulated market volatility factor"
-    )
-    
-    fee_tier = st.sidebar.selectbox(
-        "Fee Tier",
-        options=["Tier 1 (0.10%)", "Tier 2 (0.08%)", "Tier 3 (0.06%)", "Tier 4 (0.04%)"],
-        index=0,
-        help="Trading fee tier"
-    )
-    
-    # Extract fee percentage from the selected tier
-    fee_percentage = float(fee_tier.split("(")[1].split("%")[0]) / 100
-    
-    # Order type selection
-    order_side = st.sidebar.radio(
-        "Order Side",
-        options=["Buy", "Sell"],
-        index=0
-    )
-    
-    # Market selection
-    market = st.sidebar.selectbox(
-        "Market",
-        options=["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"],
-        index=0,
-        help="Select trading pair. Note: Currently, only BTC-USDT-SWAP is connected with real data."
-    )
-    
-    # Advanced options
-    with st.sidebar.expander("Advanced Options"):
-        execution_delay = st.slider(
-            "Execution Delay (ms)",
-            min_value=0,
-            max_value=500,
-            value=50,
-            step=10,
-            help="Simulated delay between order placement and execution"
-        )
-        
-        price_impact_factor = st.slider(
-            "Price Impact Factor",
-            min_value=0.1,
-            max_value=2.0,
-            value=1.0,
-            step=0.1,
-            help="Multiplier for the estimated price impact"
-        )
-        
-        use_live_data = st.checkbox(
-            "Use Live Data",
-            value=True,
-            help="Use real-time order book data. If disabled, will use simulated data."
-        )
-        
-        use_ml_model = st.checkbox(
-            "Use ML-based Slippage Prediction",
-            value=False,
-            help="Use machine learning to predict slippage instead of simulating market order execution"
-        )
-        
-        # Impact model selection 
-        impact_model = st.selectbox(
-            "Impact Model",
-            options=["Standard", "Almgren-Chriss", "Square Root"],
+    with sidebar_tab1:
+        # Market selection
+        market = st.selectbox(
+            "Select Market",
+            options=["BTC-USDT", "ETH-USDT", "BNB-USDT", "XRP-USDT", "SOL-USDT"],
             index=0,
-            help="Select market impact model for price impact calculation"
+            help="Trading pair for simulation"
         )
         
-        if use_ml_model:
-            risk_level = st.select_slider(
-                "Risk Level",
-                options=["Conservative (q90)", "Moderate (q75)", "Balanced (q50)", "Aggressive (q25)", "Optimistic (q10)", "Mean"],
-                value="Balanced (q50)",
-                help="Risk level for slippage prediction. Higher percentiles give more conservative estimates."
+        # Order configuration
+        order_side = st.radio(
+            "Order Side",
+            options=["Buy", "Sell"],
+            horizontal=True,
+            help="Market buy or sell order"
+        )
+        
+        quantity_usd = st.number_input(
+            "Order Size (USD)",
+            min_value=100.0,
+            max_value=1000000.0,
+            value=10000.0,
+            step=1000.0,
+            help="Order quantity in USD"
+        )
+        
+        # Volatility slider
+        volatility = st.slider(
+            "Market Volatility",
+            min_value=0.1,
+            max_value=1.0,
+            value=0.3,
+            step=0.05,
+            help="Annualized volatility (higher values = more slippage)"
+        )
+        
+        # Fee tier selection
+        fee_tier = st.selectbox(
+            "Fee Tier",
+            options=["VIP 0 (0.10%)", "VIP 1 (0.08%)", "VIP 2 (0.05%)", "VIP 3 (0.03%)", "VIP 4 (0.02%)"],
+            index=0,
+            help="Trading fee tier (affects total cost)"
+        )
+        
+        # Extract fee percentage from the selection
+        fee_percentage = float(fee_tier.split("(")[1].split("%")[0]) / 100
+        
+        # Advanced options
+        with st.expander("Advanced Options"):
+            execution_delay = st.slider(
+                "Execution Delay (ms)",
+                min_value=0,
+                max_value=500,
+                value=50,
+                step=10,
+                help="Simulated delay between order placement and execution"
             )
-            # Extract the risk level code from the selection
-            risk_level_code = risk_level.split("(")[1].split(")")[0] if "(" in risk_level else "mean"
-        else:
-            risk_level_code = "q50"  # Default
+            
+            price_impact_factor = st.slider(
+                "Price Impact Factor",
+                min_value=0.1,
+                max_value=2.0,
+                value=1.0,
+                step=0.1,
+                help="Multiplier for the estimated price impact"
+            )
+            
+            use_live_data = st.checkbox(
+                "Use Live Data",
+                value=True,
+                help="Use real-time order book data. If disabled, will use simulated data."
+            )
+            
+            use_ml_model = st.checkbox(
+                "Use ML-based Slippage Prediction",
+                value=False,
+                help="Use machine learning to predict slippage instead of simulating market order execution"
+            )
+            
+            # Add enhanced ML model selection
+            if use_ml_model:
+                regression_model_type = st.selectbox(
+                    "Regression Model Type",
+                    options=["Standard Linear", "Random Forest", "Gradient Boosting"],
+                    index=2,
+                    help="Select the regression model type to use for slippage prediction"
+                )
+                
+                # Map UI selection to model type
+                model_mapping = {
+                    "Standard Linear": "linear",
+                    "Random Forest": "random_forest",
+                    "Gradient Boosting": "gradient_boosting"
+                }
+                
+                model_type = model_mapping[regression_model_type]
+                
+                risk_level = st.select_slider(
+                    "Risk Level",
+                    options=["Conservative (q90)", "Moderate (q75)", "Balanced (q50)", "Aggressive (q25)", "Optimistic (q10)", "Mean"],
+                    value="Balanced (q50)",
+                    help="Risk level for slippage prediction. Higher percentiles give more conservative estimates."
+                )
+                # Extract the risk level code from the selection
+                risk_level_code = risk_level.split("(")[1].split(")")[0] if "(" in risk_level else "mean"
+            else:
+                model_type = "gradient_boosting"  # Default
+                risk_level_code = "q50"  # Default
+            
+            # Impact model selection 
+            impact_model = st.selectbox(
+                "Impact Model",
+                options=["Standard", "Almgren-Chriss", "Square Root"],
+                index=0,
+                help="Select market impact model for price impact calculation"
+            )
+            
+            # Add option to use calibrated parameters if Almgren-Chriss is selected
+            if impact_model == "Almgren-Chriss" and ALMGREN_CHRISS_AVAILABLE:
+                use_calibration = st.checkbox(
+                    "Use Calibrated Parameters",
+                    value=True,
+                    help="Use automatically calibrated parameters for the Almgren-Chriss model"
+                )
+            else:
+                use_calibration = True
+        
+        # Action buttons
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            simulate_button = st.button("Simulate", type="primary", use_container_width=True)
+        with col2:
+            reset_button = st.button("Reset", type="secondary", use_container_width=True)
+        with col3:
+            if st.button("Train Model", use_container_width=True):
+                st.info("Training slippage prediction model...")
+                
+                # Create a progress bar
+                progress_bar = st.progress(0)
+                
+                # Initialize data collector
+                collector = SlippageDataCollector()
+                
+                # Check if we have enough data
+                try:
+                    X, y = collector.get_training_data()
+                    
+                    # Update progress
+                    progress_bar.progress(30)
+                    
+                    # Initialize and train enhanced model
+                    try:
+                        model = EnhancedSlippageModel()
+                        training_result = model.train(X, y)
+                        
+                        # Update progress
+                        progress_bar.progress(100)
+                        
+                        # Show training results
+                        st.success(f"Enhanced model trained successfully with {training_result['samples_count']} samples")
+                        st.info(f"Models trained: {', '.join(training_result['models_trained'])}")
+                        
+                        # Show model performance
+                        if "model_performances" in training_result:
+                            perf_metrics = pd.DataFrame()
+                            for model_name, metrics in training_result["model_performances"].items():
+                                model_metrics = pd.DataFrame({model_name: metrics}, index=metrics.keys())
+                                perf_metrics = pd.concat([perf_metrics, model_metrics], axis=1)
+                            
+                            st.dataframe(perf_metrics)
+                    except Exception as e:
+                        # Fall back to standard model if enhanced fails
+                        model = SlippageModel()
+                        training_result = model.train(X, y)
+                        
+                        # Update progress
+                        progress_bar.progress(100)
+                        
+                        # Show training results
+                        st.warning(f"Enhanced model training failed, used standard model. Error: {str(e)}")
+                        st.success(f"Model trained successfully with {training_result['samples_count']} samples")
+                        st.info(f"R² Score: {training_result['linear_r2_score']:.4f}")
+                except ValueError as e:
+                    st.error(f"Error training model: {str(e)}")
+                    st.info("Collecting more data from order executions...")
+                finally:
+                    # Remove progress bar
+                    progress_bar.empty()
     
-    # Action buttons
-    col1, col2, col3 = st.sidebar.columns(3)
-    with col1:
-        simulate_button = st.button("Simulate", type="primary", use_container_width=True)
-    with col2:
-        reset_button = st.button("Reset", type="secondary", use_container_width=True)
-    with col3:
-        if st.button("Train Model", use_container_width=True):
-            st.sidebar.info("Training slippage prediction model...")
+    # Model Validation Tab
+    with sidebar_tab2:
+        if ALMGREN_CHRISS_AVAILABLE:
+            st.header("Almgren-Chriss Model Validation")
             
-            # Create a progress bar
-            progress_bar = st.sidebar.progress(0)
+            # Market selection for validation
+            val_market = st.selectbox(
+                "Select Market",
+                options=["BTC-USDT", "ETH-USDT", "BNB-USDT", "XRP-USDT", "SOL-USDT", "All Markets"],
+                index=0,
+                key="val_market",
+                help="Market to validate"
+            )
             
-            # Initialize data collector
+            # Time period selection
+            val_days_back = st.slider(
+                "Days to Look Back",
+                min_value=1,
+                max_value=90,
+                value=30,
+                key="val_days_back",
+                help="Number of days of historical data to use for validation"
+            )
+            
+            # Action buttons for validation
+            val_col1, val_col2 = st.columns(2)
+            with val_col1:
+                validate_button = st.button("Validate Model", type="primary", use_container_width=True)
+            with val_col2:
+                calibrate_button = st.button("Calibrate Parameters", type="secondary", use_container_width=True)
+            
+            # Display validation results
+            if validate_button:
+                st.info("Validating Almgren-Chriss model performance...")
+                
+                # Create a progress bar
+                val_progress = st.progress(0)
+                
+                try:
+                    # Initialize validator
+                    validator = ModelValidator()
+                    
+                    # Update progress
+                    val_progress.progress(30)
+                    
+                    # Validate model
+                    if val_market == "All Markets":
+                        results = validator.validate_almgren_chriss(days_back=val_days_back)
+                    else:
+                        results = validator.validate_almgren_chriss(symbol=val_market, days_back=val_days_back)
+                    
+                    # Update progress
+                    val_progress.progress(100)
+                    
+                    # Show validation summary
+                    st.success(f"Model validation completed. Results for {len(results)} markets.")
+                    
+                    # Create and display validation results dataframe
+                    val_data = []
+                    for market, metrics in results.items():
+                        val_data.append({
+                            'Market': market,
+                            'MAPE (%)': metrics['mape'],
+                            'MAE (bps)': metrics['mae'],
+                            'R²': metrics['r2'],
+                            'Samples': metrics['sample_count']
+                        })
+                    
+                    val_df = pd.DataFrame(val_data)
+                    st.dataframe(val_df, use_container_width=True)
+                    
+                    # If only one market was validated, show detailed plot
+                    if val_market != "All Markets" and val_market in results:
+                        st.subheader(f"Prediction Accuracy for {val_market}")
+                        
+                        # Generate and display validation plot
+                        img_str = validator.plot_prediction_vs_actual(val_market, val_days_back)
+                        st.image(f"data:image/png;base64,{img_str}", use_column_width=True)
+                
+                except Exception as e:
+                    st.error(f"Validation failed: {str(e)}")
+                finally:
+                    # Remove progress bar
+                    val_progress.empty()
+            
+            # Handle calibration button
+            if calibrate_button:
+                st.info("Calibrating Almgren-Chriss model parameters...")
+                
+                # Create a progress bar
+                cal_progress = st.progress(0)
+                
+                try:
+                    # Initialize calibrator
+                    calibrator = AlmgrenChrissCalibrator()
+                    
+                    # Update progress
+                    cal_progress.progress(30)
+                    
+                    # Calibrate parameters
+                    if val_market == "All Markets":
+                        results = calibrator.calibrate_parameters()
+                    else:
+                        results = calibrator.calibrate_parameters(symbol=val_market)
+                    
+                    # Update progress
+                    cal_progress.progress(100)
+                    
+                    # Show calibration results
+                    st.success(f"Parameter calibration completed for {len(results)} markets.")
+                    
+                    # Create and display calibration results dataframe
+                    cal_data = []
+                    for market, params in results.items():
+                        cal_data.append({
+                            'Market': market,
+                            'Gamma Scale': params['gamma_scale'],
+                            'Eta Scale': params['eta_scale'],
+                            'Validation MAPE (%)': params['validation_mape'],
+                            'Validation R²': params['validation_r2'],
+                            'Training Samples': params['training_records']
+                        })
+                    
+                    cal_df = pd.DataFrame(cal_data)
+                    st.dataframe(cal_df, use_container_width=True)
+                
+                except Exception as e:
+                    st.error(f"Calibration failed: {str(e)}")
+                finally:
+                    # Remove progress bar
+                    cal_progress.empty()
+        else:
+            st.info("Almgren-Chriss model validation features are not available.")
+            st.info("Please make sure the required modules are installed.")
+    
+    # Model Analysis tab
+    with sidebar_tab3:
+        st.header("Regression Model Analysis")
+        
+        # Feature importance visualization
+        st.subheader("Feature Importance")
+        
+        viz_model_type = st.selectbox(
+            "Model Type for Analysis",
+            options=["Random Forest", "Gradient Boosting"],
+            index=1,
+            key="viz_model_type"
+        )
+        
+        viz_plot_type = st.radio(
+            "Plot Type",
+            options=["Bar Chart", "Pie Chart"],
+            horizontal=True,
+            key="viz_plot_type"
+        )
+        
+        # Map selections to model values
+        viz_model_mapping = {
+            "Random Forest": "random_forest",
+            "Gradient Boosting": "gradient_boosting"
+        }
+        
+        viz_plot_mapping = {
+            "Bar Chart": "bar",
+            "Pie Chart": "pie"
+        }
+        
+        selected_model = viz_model_mapping[viz_model_type]
+        selected_plot = viz_plot_mapping[viz_plot_type]
+        
+        # Show feature importance button
+        if st.button("Show Feature Importance", key="show_importance"):
+            # Initialize enhanced model
+            model = EnhancedSlippageModel()
+            
+            # Generate plot
+            fig = model.plot_feature_importance(selected_model, selected_plot)
+            
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+                st.info("""
+                Feature importance shows which factors contribute most to slippage prediction.
+                Higher values indicate stronger influence on execution costs.
+                """)
+            else:
+                st.warning(f"No feature importance data available for {viz_model_type}. Please train the model first.")
+        
+        # Model comparison
+        st.subheader("Model Performance Comparison")
+        
+        if st.button("Compare Models", key="compare_models"):
+            # Initialize enhanced model
+            model = EnhancedSlippageModel()
+            
+            # Generate performance comparison plot
+            fig = model.compare_model_performance()
+            
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+                st.info("""
+                Model comparison shows how different regression techniques perform:
+                - R² Score: Higher is better (closer to 1.0)
+                - RMSE (Root Mean Squared Error): Lower is better
+                - MAE (Mean Absolute Error): Lower is better
+                """)
+            else:
+                st.warning("No model performance data available. Please train the models first.")
+        
+        # Time series analysis
+        st.subheader("Time Series Analysis")
+        
+        forecast_days = st.slider(
+            "Forecast Days",
+            min_value=1,
+            max_value=30,
+            value=7,
+            help="Number of days to forecast slippage trends"
+        )
+        
+        if st.button("Generate Forecast", key="generate_forecast"):
+            # Initialize time series model
+            ts_model = TimeSeriesSlippageModel()
+            
+            # Get historical data
             collector = SlippageDataCollector()
             
-            # Check if we have enough data
-            try:
-                X, y = collector.get_training_data()
-                
-                # Update progress
-                progress_bar.progress(30)
-                
-                # Initialize and train model
-                model = SlippageModel()
-                training_result = model.train(X, y)
-                
-                # Update progress
-                progress_bar.progress(100)
-                
-                # Show training results
-                st.sidebar.success(f"Model trained successfully with {training_result['samples_count']} samples")
-                st.sidebar.info(f"R² Score: {training_result['linear_r2_score']:.4f}")
-            except ValueError as e:
-                st.sidebar.error(f"Error training model: {str(e)}")
-                st.sidebar.info("Collecting more data from order executions...")
-            finally:
-                # Remove progress bar
-                progress_bar.empty()
+            if collector.data is not None and len(collector.data) >= 30:
+                try:
+                    # Train the model if not already trained
+                    training_result = ts_model.train(collector.data)
+                    
+                    # Generate forecast
+                    forecast_data = ts_model.forecast_slippage_trend(
+                        collector.data,
+                        days_ahead=forecast_days
+                    )
+                    
+                    # Generate plot
+                    fig = ts_model.plot_slippage_trend(collector.data, forecast_data)
+                    
+                    if fig:
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.info(f"Forecast generated for the next {forecast_days} days based on historical patterns.")
+                    else:
+                        st.warning("Could not generate forecast visualization.")
+                except Exception as e:
+                    st.error(f"Time series forecasting failed: {str(e)}")
+            else:
+                st.warning("Not enough historical data for time series forecasting. Need at least 30 records.")
+                st.info(f"Current records: {0 if collector.data is None else len(collector.data)}")
     
     # Initialize session state for storing simulation results
     if 'simulation_results' not in st.session_state:
         st.session_state.simulation_results = None
+    
+    # Initialize session state variables for scenarios
+    if 'scenarios' not in st.session_state:
+        st.session_state.scenarios = []
+        
+    if 'execution_history' not in st.session_state:
+        st.session_state.execution_history = pd.DataFrame()
     
     # Main panel
     col1, col2 = st.columns(2)
@@ -552,9 +1675,9 @@ def main():
         fig = plot_orderbook(order_book)
         st.plotly_chart(fig, use_container_width=True)
     
-    # Simulate button logic
+    # Simulation logic
     if simulate_button:
-        # Record the start time
+        # Start measuring execution time
         start_time = time.time()
         
         # Calculate market depth for Almgren-Chriss model
@@ -581,18 +1704,71 @@ def main():
         
         # Run the simulation based on the selected method
         if use_ml_model:
-            # Use ML-based prediction
-            actual_result = simulate_market_order_with_ml(
+            # Check if we should use enhanced ML models
+            if regression_model_type != "Standard Linear":
+                # Use enhanced ML-based prediction with advanced models
+                actual_result = simulate_market_order_with_enhanced_ml(
+                    order_book,
+                    order_side.lower(),
+                    quantity_usd,
+                    volatility,
+                    fee_percentage,
+                    model_type,
+                    risk_level_code
+                )
+            else:
+                # Use standard ML-based prediction
+                actual_result = simulate_market_order_with_ml(
+                    order_book,
+                    order_side.lower(),
+                    quantity_usd,
+                    volatility,
+                    fee_percentage,
+                    risk_level_code
+                )
+            
+            # For ML model, expected and actual are the same since this is a prediction
+            expected_metrics = actual_result
+            actual_metrics = actual_result
+        elif impact_model == "Almgren-Chriss" and ALMGREN_CHRISS_AVAILABLE:
+            # Use the Almgren-Chriss model for simulation
+            market_resilience = 0.3  # Could be made a UI parameter
+            market_cap = None  # Could be made a UI parameter or fetched from an API
+            
+            actual_result = simulate_market_order_with_impact(
                 order_book,
                 order_side.lower(),
                 quantity_usd,
                 volatility,
+                market_resilience,
+                market_cap,
                 fee_percentage,
-                risk_level_code
+                use_calibration
             )
             
-            # For ML model, expected and actual are the same since this is a prediction
+            # For Almgren-Chriss, expected and actual are the same
             expected_metrics = actual_result
+            actual_metrics = actual_result
+            
+            # Save the execution data for ML training
+            try:
+                data_collector = SlippageDataCollector()
+                data_collector.add_execution_data(
+                    order_result=actual_result,
+                    order_book=order_book,
+                    volatility=volatility
+                )
+                logging.info(f"Saved execution data for ML training, current records: {len(data_collector.data)}")
+                
+                # Also save to our execution history for dashboard
+                save_execution_to_history(
+                    actual_result,
+                    order_side.lower(),
+                    quantity_usd,
+                    order_book
+                )
+            except Exception as e:
+                logging.error(f"Error saving execution data: {e}")
         else:
             # Run the standard simulation
             expected_result = simulate_market_order(
@@ -624,14 +1800,29 @@ def main():
                     volatility=volatility
                 )
                 logging.info(f"Saved execution data for ML training, current records: {len(data_collector.data)}")
+                
+                # Also save to our execution history for dashboard
+                save_execution_to_history(
+                    actual_metrics,
+                    order_side.lower(),
+                    quantity_usd,
+                    order_book
+                )
             except Exception as e:
                 logging.error(f"Error saving execution data: {e}")
         
-        # If using ML model, set actual_metrics to be the same as the prediction
-        if use_ml_model:
-            actual_metrics = actual_result
-            
-            # Add simulation metadata
+        # Store results in session state
+        st.session_state.simulation_results = {
+            "expected": expected_metrics,
+            "actual": actual_metrics,
+            "order_book": order_book,  # Store order book state for visualization
+            "highlight_levels": actual_result if "execution_detail" in actual_result else None,
+            "market": market,
+            "model_type": "ml" if use_ml_model else "almgren_chriss" if impact_model == "Almgren-Chriss" else "simulation"
+        }
+        
+        # Add simulation metadata if missing
+        if use_ml_model and "execution_time_ms" not in actual_metrics:
             actual_metrics["execution_time_ms"] = 0
             actual_metrics["levels_walked"] = 0
             actual_metrics["execution_detail"] = []
@@ -644,19 +1835,10 @@ def main():
         actual_metrics["internal_latency_ms"] = internal_latency
         actual_metrics["external_latency_ms"] = execution_delay
         
-        # Add impact model metrics
+        # Add impact model metrics to all simulation flows
         actual_metrics["ac_impact_pct"] = ac_impact
         actual_metrics["sq_impact_pct"] = sq_impact
         actual_metrics["selected_impact_model"] = impact_model
-        
-        # Store simulation results in session state
-        st.session_state.simulation_results = {
-            "expected": expected_metrics,
-            "actual": actual_metrics,
-            "order_book": order_book,
-            "market": market,
-            "model_type": "ml" if use_ml_model else "simulation"
-        }
         
         # Update the order book visualization with executed levels
         with orderbook_placeholder.container():
@@ -701,6 +1883,10 @@ def main():
                         st.metric(label="Trading Fee", value=format_currency(actual_metrics["fee_usd"]))
                         st.metric(label="Total Cost", value=format_currency(actual_metrics["total_cost"]))
                         st.metric(label="Risk Level", value=actual_metrics.get("risk_level", "Default"))
+                        
+                        # Show model type and risk level
+                        model_display_name = next((k for k, v in model_mapping.items() if v == model_type), model_type)
+                        st.metric(label="Model Type", value=model_display_name)
                         
                         # Maker/Taker information
                         st.metric(label="Taker Proportion", value=f"{actual_metrics.get('taker_proportion', 1.0)*100:.0f}%")
@@ -867,49 +2053,112 @@ def main():
                             st.markdown(f"- Potential Fee Savings: {fee_savings:.4f}%")
                     
                     # Regression vs Actual Slippage Comparison
-                    if use_ml_model and "prediction" in actual_metrics:
+                    if use_ml_model:
                         st.markdown("**Regression Model Performance**")
                         
                         # Create a comparison table
-                        pred = actual_metrics["prediction"]
-                        
-                        if "all_predictions" in pred:
-                            predictions = pred["all_predictions"]
-                            st.markdown(f"- Predicted Slippage (Selected): {format_percentage(actual_metrics['slippage_pct'])}")
+                        if "prediction" in actual_metrics:
+                            pred = actual_metrics["prediction"]
                             
-                            # Create dataframe for visualization
-                            pred_data = []
-                            for q_name, q_value in predictions.items():
-                                pred_data.append({
-                                    'Model': f"{q_name}",
-                                    'Predicted Slippage (%)': q_value/100
-                                })
-                            
-                            pred_df = pd.DataFrame(pred_data)
-                            
-                            # Sort by predicted slippage
-                            pred_df = pred_df.sort_values('Predicted Slippage (%)', ascending=False)
-                            
-                            # Display table
-                            st.dataframe(pred_df, use_container_width=True)
-                            
-                            # Bar chart of predictions
-                            pred_fig = px.bar(
-                                pred_df,
-                                x='Model',
-                                y='Predicted Slippage (%)', 
-                                title='Slippage Predictions by Model',
-                                height=300
-                            )
-                            
-                            pred_fig.add_hline(
-                                y=actual_metrics['slippage_pct'], 
-                                line_dash="dash", 
-                                line_color="red",
-                                annotation_text=f"Selected ({risk_level_code})"
-                            )
-                            
-                            st.plotly_chart(pred_fig, use_container_width=True)
+                            # For enhanced models, we have predictions from multiple models
+                            if "all_model_predictions" in pred:
+                                predictions = pred["all_model_predictions"]
+                                st.markdown(f"- Model Used: {model_display_name}")
+                                
+                                # Create dataframe for visualization
+                                pred_data = []
+                                for model_name, pred_value in predictions.items():
+                                    # Map internal model names to display names
+                                    display_name = next((k for k, v in model_mapping.items() if v == model_name), model_name)
+                                    pred_data.append({
+                                        'Model': display_name,
+                                        'Predicted Slippage (bps)': pred_value
+                                    })
+                                
+                                pred_df = pd.DataFrame(pred_data)
+                                
+                                # Sort by predicted slippage
+                                pred_df = pred_df.sort_values('Predicted Slippage (bps)', ascending=False)
+                                
+                                # Display table
+                                st.dataframe(pred_df, use_container_width=True)
+                                
+                                # Bar chart of predictions
+                                pred_fig = px.bar(
+                                    pred_df,
+                                    x='Model',
+                                    y='Predicted Slippage (bps)', 
+                                    title='Slippage Predictions by Model',
+                                    height=300
+                                )
+                                
+                                # Add a line for the selected model
+                                selected_value = predictions[model_type]
+                                pred_fig.add_hline(
+                                    y=selected_value, 
+                                    line_dash="dash", 
+                                    line_color="red",
+                                    annotation_text=f"Selected ({model_display_name})"
+                                )
+                                
+                                st.plotly_chart(pred_fig, use_container_width=True)
+                                
+                                # Feature importance if available
+                                if regression_model_type != "Standard Linear":
+                                    st.markdown("**Feature Importance**")
+                                    st.markdown("The key factors influencing slippage in this prediction:")
+                                    
+                                    # Initialize model to get feature importance
+                                    model = EnhancedSlippageModel()
+                                    imp_fig = model.plot_feature_importance(model_type, "bar")
+                                    
+                                    if imp_fig:
+                                        st.plotly_chart(imp_fig, use_container_width=True)
+                                    else:
+                                        st.info("Feature importance visualization not available. Train the model first.")
+                            elif "all_predictions" in pred:
+                                st.markdown("**Regression Model Performance**")
+                                
+                                # Create a comparison table
+                                pred = pred["all_predictions"]
+                                
+                                st.markdown(f"- Predicted Slippage (Selected): {format_percentage(pred[risk_level_code])}")
+                                
+                                # Create dataframe for visualization
+                                pred_data = []
+                                for q_name, q_value in pred.items():
+                                    pred_data.append({
+                                        'Model': q_name,
+                                        'Predicted Slippage (%)': q_value
+                                    })
+                                
+                                pred_df = pd.DataFrame(pred_data)
+                                
+                                # Sort by predicted slippage
+                                pred_df = pred_df.sort_values('Predicted Slippage (%)', ascending=False)
+                                
+                                # Display table
+                                st.dataframe(pred_df, use_container_width=True)
+                                
+                                # Bar chart of predictions
+                                pred_fig = px.bar(
+                                    pred_df,
+                                    x='Model',
+                                    y='Predicted Slippage (%)', 
+                                    title='Slippage Predictions by Model',
+                                    height=300
+                                )
+                                
+                                # Add a line for the selected model
+                                selected_value = pred[risk_level_code]
+                                pred_fig.add_hline(
+                                    y=selected_value, 
+                                    line_dash="dash", 
+                                    line_color="red",
+                                    annotation_text=f"Selected ({risk_level_code})"
+                                )
+                                
+                                st.plotly_chart(pred_fig, use_container_width=True)
                     
                     # Execution details
                     st.markdown(f"**Execution Details**")
@@ -934,6 +2183,220 @@ def main():
     # Footer
     st.markdown("---")
     st.caption("Market Order Simulator | Data from OKX | Built with Streamlit")
+
+    # Add the new visualization tabs
+    with st.expander("Advanced Visualizations", expanded=True):
+        viz_tabs = st.tabs([
+            "Order Book Heatmap", 
+            "Execution Analysis", 
+            "Execution Quality Dashboard",
+            "Scenario Analysis"
+        ])
+        
+        # 1. Order Book Heatmap tab
+        with viz_tabs[0]:
+            st.subheader("Order Book Heatmap")
+            
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                heatmap_depth = st.slider("Depth to Display", 5, 50, 20, 
+                                         help="Number of price levels to display in the heatmap")
+            with col2:
+                normalize = st.checkbox("Normalize Quantities", value=True, 
+                                      help="Normalize quantities for better visualization")
+            
+            # Display the heatmap
+            heatmap_fig = plot_orderbook_heatmap(st.session_state.order_book, heatmap_depth, normalize)
+            st.plotly_chart(heatmap_fig, use_container_width=True)
+        
+        # 2. Execution Analysis tab - Walking the Book
+        with viz_tabs[1]:
+            st.subheader("Order Execution Analysis")
+            
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                exec_side = st.selectbox("Order Side", ["Buy", "Sell"], key="exec_side")
+                
+            with col2:
+                exec_qty = st.number_input("Order Size (USD)", 
+                                         min_value=100.0, max_value=500000.0, value=10000.0, step=1000.0,
+                                         key="exec_qty")
+            
+            # Run the simulation when user clicks the button
+            if st.button("Simulate Execution", key="exec_sim_btn"):
+                with st.spinner("Simulating order execution..."):
+                    # Run the simulation
+                    exec_simulation = simulate_market_order(
+                        st.session_state.order_book, exec_side.lower(), exec_qty
+                    )
+                    
+                    # Store the simulation in session state
+                    st.session_state.exec_simulation = exec_simulation
+            
+            # Show the execution visualization
+            if 'exec_simulation' in st.session_state:
+                if st.session_state.exec_simulation["success"]:
+                    # Display the walking the book visualization
+                    walk_fig = plot_order_walk_visualization(
+                        st.session_state.exec_simulation, 
+                        st.session_state.order_book
+                    )
+                    st.plotly_chart(walk_fig, use_container_width=True)
+                    
+                    # Display execution summary
+                    metrics = calculate_order_metrics(st.session_state.exec_simulation, 0.001)
+                    
+                    st.subheader("Execution Summary")
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Avg. Execution Price", f"${metrics['avg_execution_price']:.2f}")
+                    with col2:
+                        st.metric("Slippage", f"{metrics['slippage_bps']:.2f} bps")
+                    with col3:
+                        st.metric("Total Cost", f"${metrics['total_cost']:.2f}")
+                else:
+                    st.error("Simulation failed: Insufficient liquidity")
+        
+        # 3. Execution Quality Dashboard tab
+        with viz_tabs[2]:
+            st.subheader("Execution Quality Dashboard")
+            
+            if st.session_state.execution_history.empty:
+                st.info("No execution history available. Execute some orders to see performance metrics.")
+            else:
+                # Create the dashboard
+                dashboard_figs = create_execution_quality_dashboard(st.session_state.execution_history)
+                
+                # Display each figure in the dashboard
+                for fig in dashboard_figs:
+                    st.plotly_chart(fig, use_container_width=True)
+        
+        # 4. Scenario Analysis tab
+        with viz_tabs[3]:
+            st.subheader("Scenario Analysis")
+            
+            with st.form("scenario_form"):
+                st.subheader("Add New Scenario")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    scenario_name = st.text_input("Scenario Name", value=f"Scenario {len(st.session_state.scenarios) + 1}")
+                    scenario_side = st.selectbox("Order Side", ["Buy", "Sell"], key="scenario_side")
+                    scenario_qty = st.number_input(
+                        "Order Size (USD)", 
+                        min_value=100.0, 
+                        max_value=1000000.0, 
+                        value=10000.0,
+                        step=1000.0,
+                        key="scenario_qty"
+                    )
+                
+                with col2:
+                    scenario_model = st.selectbox(
+                        "Execution Model", 
+                        ["Basic", "ML-based", "Enhanced ML", "Almgren-Chriss"],
+                        key="scenario_model",
+                        format_func=lambda x: {
+                            "Basic": "Basic (No ML)",
+                            "ML-based": "ML Prediction",
+                            "Enhanced ML": "Enhanced ML",
+                            "Almgren-Chriss": "Almgren-Chriss Model"
+                        }.get(x, x)
+                    )
+                    
+                    scenario_volatility = st.slider(
+                        "Volatility", 
+                        min_value=0.0, 
+                        max_value=1.0,
+                        value=0.2,
+                        step=0.05,
+                        key="scenario_volatility"
+                    )
+                    
+                    scenario_fee = st.slider(
+                        "Fee Percentage",
+                        min_value=0.0,
+                        max_value=0.5,
+                        value=0.1,
+                        step=0.01,
+                        key="scenario_fee",
+                        format="%.2f%%"
+                    ) / 100  # Convert from percentage to decimal
+                
+                submit_scenario = st.form_submit_button("Add Scenario")
+            
+            if submit_scenario:
+                with st.spinner("Running scenario simulation..."):
+                    # Map the model selection to the API names
+                    model_map = {
+                        "Basic": "basic",
+                        "ML-based": "ml",
+                        "Enhanced ML": "enhanced_ml",
+                        "Almgren-Chriss": "almgren_chriss"
+                    }
+                    model_type = model_map.get(scenario_model, "basic")
+                    
+                    # Run the simulation
+                    simulation_result = run_scenario_simulation(
+                        st.session_state.order_book,
+                        scenario_side.lower(),
+                        scenario_qty,
+                        model_type,
+                        scenario_volatility,
+                        scenario_fee
+                    )
+                    
+                    # Add to scenarios list
+                    st.session_state.scenarios.append({
+                        'name': scenario_name,
+                        'side': scenario_side.lower(),
+                        'quantity_usd': scenario_qty,
+                        'model_type': model_type,
+                        'volatility': scenario_volatility,
+                        'fee_percentage': scenario_fee,
+                        'simulation_result': simulation_result
+                    })
+                    
+                    st.success(f"Added scenario: {scenario_name}")
+            
+            # Display existing scenarios
+            if st.session_state.scenarios:
+                st.subheader("Manage Scenarios")
+                
+                # Show a table of current scenarios
+                scenario_df = pd.DataFrame([
+                    {
+                        'Name': s['name'],
+                        'Side': s['side'].capitalize(),
+                        'Order Size': f"${s['quantity_usd']:,.2f}",
+                        'Model': s['model_type'].replace('_', ' ').title(),
+                        'Avg. Price': f"${s['simulation_result'].get('avg_execution_price', 0):,.2f}",
+                        'Slippage': f"{s['simulation_result'].get('slippage_bps', 0):.2f} bps"
+                    } for s in st.session_state.scenarios
+                ])
+                
+                st.dataframe(scenario_df, use_container_width=True)
+                
+                # Option to clear all scenarios
+                col1, col2 = st.columns([1, 4])
+                with col1:
+                    if st.button("Clear All Scenarios"):
+                        st.session_state.scenarios = []
+                        st.experimental_rerun()
+                
+                # Display the scenario comparison visualizations
+                if len(st.session_state.scenarios) > 0:
+                    st.subheader("Scenario Comparison")
+                    scenario_figs = create_scenario_analysis(
+                        st.session_state.order_book,
+                        st.session_state.scenarios
+                    )
+                    
+                    # Display each comparison figure
+                    for fig in scenario_figs:
+                        st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Add scenarios to compare different execution strategies.")
 
 
 if __name__ == "__main__":
