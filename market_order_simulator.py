@@ -466,73 +466,283 @@ def simulate_market_order_with_ml(
     )
 
 
+class ModelSelectionStrategy:
+    """
+    Implements a decision-making framework for selecting the appropriate 
+    market impact model based on order characteristics and market conditions.
+    
+    This strategy selects between:
+    1. Simple order book simulation (for small orders)
+    2. ML-based slippage prediction (for medium orders)
+    3. Almgren-Chriss model (for large orders and execution planning)
+    """
+    
+    def __init__(self):
+        # Define thresholds for model selection
+        self.small_order_threshold = 0.01  # 1% of avg daily volume
+        self.large_order_threshold = 0.05  # 5% of avg daily volume
+        self.high_volatility_threshold = 0.4  # 40% annualized vol
+        
+        # Check if enhanced models are available
+        self.has_enhanced_models = ENHANCED_MODELS_AVAILABLE
+        
+        # Check if Almgren-Chriss model is available
+        try:
+            import almgren_chriss as ac
+            from almgren_chriss_calibration import AlmgrenChrissCalibrator
+            self.has_almgren_chriss = True
+        except ImportError:
+            self.has_almgren_chriss = False
+    
+    def select_model(self, order_book, side, quantity_usd, volatility, 
+                    avg_daily_volume, execution_timeframe=None):
+        """
+        Select the most appropriate market impact model for the given order.
+        
+        Args:
+            order_book: Current order book state
+            side: 'buy' or 'sell'
+            quantity_usd: Order size in USD
+            volatility: Market volatility
+            avg_daily_volume: Average daily trading volume in USD
+            execution_timeframe: Optional timeframe for execution in hours
+            
+        Returns:
+            Dictionary with selected model and rationale
+        """
+        # Calculate order size relative to daily volume
+        if avg_daily_volume > 0:
+            relative_size = quantity_usd / avg_daily_volume
+        else:
+            relative_size = 0.1  # Default to medium-sized if volume unknown
+        
+        # Check execution timeframe
+        has_execution_window = execution_timeframe is not None and execution_timeframe > 0
+        
+        # Calculate order book depth
+        bid_depth = sum(qty for _, qty in order_book.get_bids())
+        ask_depth = sum(qty for _, qty in order_book.get_asks())
+        
+        # Check if order size exceeds available liquidity
+        if side.lower() == 'buy' and quantity_usd > ask_depth:
+            exceeds_orderbook = True
+        elif side.lower() == 'sell' and quantity_usd > bid_depth:
+            exceeds_orderbook = True
+        else:
+            exceeds_orderbook = False
+        
+        # 1. SMALL orders with sufficient liquidity -> Order book simulation
+        if relative_size <= self.small_order_threshold and not exceeds_orderbook:
+            model_type = "orderbook"
+            rationale = "Small order with sufficient liquidity in order book"
+        
+        # 2. LARGE orders or orders with execution timeframe -> Almgren-Chriss
+        elif (relative_size >= self.large_order_threshold or has_execution_window) and self.has_almgren_chriss:
+            model_type = "almgren_chriss"
+            rationale = "Large order size relative to daily volume" if relative_size >= self.large_order_threshold else "Order with specific execution timeframe"
+        
+        # 3. MEDIUM orders with enhanced models available -> ML model
+        elif self.has_enhanced_models:
+            # For high volatility scenarios, prefer Almgren-Chriss if available
+            if volatility >= self.high_volatility_threshold and self.has_almgren_chriss:
+                model_type = "almgren_chriss"
+                rationale = "Medium order in high volatility conditions"
+            else:
+                model_type = "ml_enhanced"
+                rationale = "Medium-sized order, using ML prediction"
+        
+        # 4. MEDIUM orders without enhanced models -> Basic ML or order book
+        else:
+            if exceeds_orderbook and self.has_almgren_chriss:
+                model_type = "almgren_chriss"
+                rationale = "Order exceeds visible liquidity in order book"
+            else:
+                model_type = "ml_basic"
+                rationale = "Medium-sized order, using basic ML prediction"
+        
+        # Prepare result with additional context for the decision
+        result = {
+            "selected_model": model_type,
+            "rationale": rationale,
+            "order_metrics": {
+                "relative_size": relative_size,
+                "exceeds_orderbook": exceeds_orderbook,
+                "high_volatility": volatility >= self.high_volatility_threshold,
+                "has_execution_window": has_execution_window
+            }
+        }
+        
+        return result
+    
+    def simulate_with_selected_model(self, order_book, side, quantity_usd, 
+                                    volatility, avg_daily_volume, 
+                                    fee_percentage=0.001, 
+                                    execution_timeframe=None,
+                                    market_resilience=0.1):
+        """
+        Simulate market order using the automatically selected model.
+        
+        Args:
+            order_book: Current order book state
+            side: 'buy' or 'sell'
+            quantity_usd: Order size in USD
+            volatility: Market volatility
+            avg_daily_volume: Average daily trading volume in USD
+            fee_percentage: Trading fee percentage
+            execution_timeframe: Optional timeframe for execution in hours
+            market_resilience: Market resilience factor for Almgren-Chriss
+            
+        Returns:
+            Dictionary with simulation results
+        """
+        # Select appropriate model
+        selection = self.select_model(order_book, side, quantity_usd, 
+                                     volatility, avg_daily_volume, execution_timeframe)
+        model_type = selection["selected_model"]
+        
+        # Simulate using the selected model
+        if model_type == "orderbook":
+            # Use simple order book simulation
+            result = simulate_market_order(order_book, side, quantity_usd)
+            
+        elif model_type == "ml_basic":
+            # Use basic ML model
+            result = simulate_market_order_with_ml(
+                order_book, side, quantity_usd, volatility, fee_percentage
+            )
+            
+        elif model_type == "ml_enhanced" and self.has_enhanced_models:
+            # Use enhanced ML model
+            result = simulate_market_order_with_enhanced_ml(
+                order_book, side, quantity_usd, volatility, fee_percentage
+            )
+            
+        elif model_type == "almgren_chriss" and self.has_almgren_chriss:
+            import almgren_chriss as ac
+            
+            if execution_timeframe is not None and execution_timeframe > 0:
+                # Use optimal execution strategy for large orders with timeframe
+                result = ac.compare_execution_strategies(
+                    order_book, side, quantity_usd, execution_timeframe,
+                    volatility, market_resilience
+                )
+            else:
+                # Use Almgren-Chriss for immediate execution
+                result = ac.simulate_market_order_with_impact(
+                    order_book, side, quantity_usd, volatility,
+                    market_resilience, None, fee_percentage
+                )
+        else:
+            # Fallback to order book simulation
+            result = simulate_market_order(order_book, side, quantity_usd)
+            selection["rationale"] += " (fallback due to model unavailability)"
+        
+        # Add selection details to result
+        result["model_selection"] = selection
+        
+        return result
+
+    def compare_all_models(self, order_book, side, quantity_usd, volatility, 
+                         avg_daily_volume, fee_percentage=0.001,
+                         execution_timeframe=None):
+        """
+        Run simulations using all available models for comparison.
+        
+        Args:
+            order_book: Current order book state
+            side: 'buy' or 'sell'
+            quantity_usd: Order size in USD
+            volatility: Market volatility
+            avg_daily_volume: Average daily trading volume in USD
+            fee_percentage: Trading fee percentage
+            execution_timeframe: Optional timeframe for execution in hours
+            
+        Returns:
+            Dictionary with results from all models
+        """
+        results = {
+            "order_details": {
+                "side": side,
+                "quantity_usd": quantity_usd,
+                "volatility": volatility,
+                "relative_size": quantity_usd / avg_daily_volume if avg_daily_volume > 0 else None
+            }
+        }
+        
+        # 1. Order book simulation
+        try:
+            results["orderbook"] = simulate_market_order(order_book, side, quantity_usd)
+        except Exception as e:
+            results["orderbook"] = {"error": str(e)}
+        
+        # 2. Basic ML model
+        try:
+            results["ml_basic"] = simulate_market_order_with_ml(
+                order_book, side, quantity_usd, volatility, fee_percentage
+            )
+        except Exception as e:
+            results["ml_basic"] = {"error": str(e)}
+        
+        # 3. Enhanced ML model (if available)
+        if self.has_enhanced_models:
+            try:
+                results["ml_enhanced"] = simulate_market_order_with_enhanced_ml(
+                    order_book, side, quantity_usd, volatility, fee_percentage
+                )
+            except Exception as e:
+                results["ml_enhanced"] = {"error": str(e)}
+        
+        # 4. Almgren-Chriss model (if available)
+        if self.has_almgren_chriss:
+            import almgren_chriss as ac
+            try:
+                if execution_timeframe is not None and execution_timeframe > 0:
+                    results["almgren_chriss"] = ac.compare_execution_strategies(
+                        order_book, side, quantity_usd, execution_timeframe,
+                        volatility, 0.1  # default market resilience
+                    )
+                else:
+                    results["almgren_chriss"] = ac.simulate_market_order_with_impact(
+                        order_book, side, quantity_usd, volatility,
+                        0.1, None, fee_percentage
+                    )
+            except Exception as e:
+                results["almgren_chriss"] = {"error": str(e)}
+        
+        # Add model selection recommendation
+        selection = self.select_model(
+            order_book, side, quantity_usd, volatility, 
+            avg_daily_volume, execution_timeframe
+        )
+        results["recommended_model"] = selection
+        
+        return results
+
 # Example usage
 if __name__ == "__main__":
     # Create a sample order book
-    from orderbook import OrderBook
-    
-    # Initialize order book
-    book = OrderBook("BTC-USDT")
-    
-    # Sample data
+    order_book = OrderBook("BTC-USDT")
     sample_data = {
-        'bids': [['50000.0', '1.5'], ['49900.0', '2.3'], ['49800.0', '5.0'], ['49700.0', '7.0']],
-        'asks': [['50100.0', '1.0'], ['50200.0', '3.2'], ['50300.0', '2.5'], ['50400.0', '4.0']]
+        'bids': [['49900', '1.5'], ['49800', '2.0']],
+        'asks': [['50000', '1.0'], ['50100', '3.0']]
     }
+    order_book.update(sample_data)
     
-    # Update the order book
-    book.update(sample_data)
+    # Sample parameters
+    side = "buy"
+    quantity_usd = 100000  # $100k order
+    volatility = 0.35  # 35% annualized
+    avg_daily_volume = 5000000  # $5M daily volume
     
-    # Simulate a buy order
-    buy_result = simulate_market_order(book, 'buy', 100000.0)
+    # Create model selector
+    model_selector = ModelSelectionStrategy()
     
-    # Calculate metrics with a 0.10% fee
-    buy_metrics = calculate_order_metrics(buy_result, 0.001)
-    
-    # Print results
-    print(f"Buy Order Simulation:")
-    print(f"  Quantity: ${buy_metrics['quantity_usd']:.2f}")
-    print(f"  Executed: {buy_metrics['executed_quantity']:.6f} BTC")
-    print(f"  Avg Price: ${buy_metrics['avg_execution_price']:.2f}")
-    print(f"  Expected Price: ${buy_metrics['expected_price']:.2f}")
-    print(f"  Slippage: {buy_metrics['slippage_pct']:.4f}%")
-    print(f"  Fee: ${buy_metrics['fee_usd']:.2f}")
-    print(f"  Total Cost: ${buy_metrics['total_cost']:.2f}")
-    print(f"  Levels Walked: {buy_metrics['levels_walked']}")
-    print(f"  Maker/Taker: {buy_metrics['maker_proportion']:.1%} Maker / {buy_metrics['taker_proportion']:.1%} Taker")
-    
-    # Simulate a sell order
-    sell_result = simulate_market_order(book, 'sell', 100000.0)
-    
-    # Calculate metrics with a 0.10% fee
-    sell_metrics = calculate_order_metrics(sell_result, 0.001)
+    # Compare all models
+    comparison = model_selector.compare_all_models(
+        order_book, side, quantity_usd, volatility, avg_daily_volume,
+        execution_timeframe=2  # 2-hour execution window
+    )
     
     # Print results
-    print(f"\nSell Order Simulation:")
-    print(f"  Quantity: ${sell_metrics['quantity_usd']:.2f}")
-    print(f"  Executed: {sell_metrics['executed_quantity']:.6f} BTC")
-    print(f"  Avg Price: ${sell_metrics['avg_execution_price']:.2f}")
-    print(f"  Expected Price: ${sell_metrics['expected_price']:.2f}")
-    print(f"  Slippage: {sell_metrics['slippage_pct']:.4f}%")
-    print(f"  Fee: ${sell_metrics['fee_usd']:.2f}")
-    print(f"  Total Cost: ${sell_metrics['total_cost']:.2f}")
-    print(f"  Levels Walked: {sell_metrics['levels_walked']}")
-    print(f"  Maker/Taker: {sell_metrics['maker_proportion']:.1%} Maker / {sell_metrics['taker_proportion']:.1%} Taker")
-    
-    # Example of ML-based simulation
-    print("\nML-Based Order Simulation:")
-    volatility = 0.3  # Sample volatility value
-    ml_result = simulate_market_order_with_ml(book, 'buy', 100000.0, volatility)
-    
-    if "success" in ml_result and ml_result["success"]:
-        print(f"  Quantity: ${ml_result['quantity_usd']:.2f}")
-        print(f"  Executed: {ml_result['executed_quantity']:.6f} BTC")
-        print(f"  Predicted Price: ${ml_result['avg_execution_price']:.2f}")
-        print(f"  Expected Price: ${ml_result['expected_price']:.2f}")
-        print(f"  Predicted Slippage: {ml_result['slippage_pct']:.4f}%")
-        print(f"  Fee: ${ml_result['fee_usd']:.2f}")
-        print(f"  Total Cost: ${ml_result['total_cost']:.2f}")
-        print(f"  Risk Level: {ml_result['risk_level']}")
-        print(f"  Maker/Taker: {ml_result['maker_proportion']:.1%} Maker / {ml_result['taker_proportion']:.1%} Taker")
-    else:
-        print(f"  Error: {ml_result.get('error', 'Unknown error')}") 
+    import json
+    print(json.dumps(comparison.get("recommended_model"), indent=2)) 

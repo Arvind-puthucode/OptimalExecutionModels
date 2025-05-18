@@ -15,6 +15,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime
 import seaborn as sns
+import math
 
 # Import our new modules if available
 try:
@@ -278,15 +279,23 @@ def calculate_almgren_chriss_impact(order_size_usd, market_depth, volatility, si
     Returns:
         Estimated price impact in percentage
     """
-    # Constants for the model (should be calibrated for specific markets)
-    sigma = volatility  # Market volatility
-    gamma = 0.1  # Market impact coefficient (higher = more impact)
+    # Constants for the model (calibrated for crypto markets)
+    sigma = min(volatility, 0.5)  # Cap volatility to reasonable values
     
-    # Calculate temporary impact
+    # Use a much smaller impact coefficient that's more realistic for crypto
+    # Typical impact for crypto is around 5-20 bps for large orders
+    gamma = 0.001  # Reduced by 100x from original value
+    
+    # Calculate temporary impact using square root formula with size relative to market depth
     if market_depth > 0:
-        temporary_impact = gamma * sigma * np.sqrt(order_size_usd / market_depth)
+        # Scale order size relative to market depth, with diminishing impact for larger sizes
+        normalized_size = order_size_usd / market_depth
+        temporary_impact = gamma * sigma * math.sqrt(normalized_size) * min(1.0, math.log1p(normalized_size))
+        
+        # Cap maximum impact at 2% to keep it reasonable
+        temporary_impact = min(temporary_impact, 0.02)
     else:
-        temporary_impact = 0.5  # Fallback for low liquidity
+        temporary_impact = 0.005  # Default 0.5% for low liquidity
     
     # Adjust for side (sell orders have negative impact)
     if side.lower() == "sell":

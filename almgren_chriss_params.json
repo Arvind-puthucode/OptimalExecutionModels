@@ -1,0 +1,14 @@
+{
+  "BTC-USDT-SWAP": {
+    "gamma_scale": 0.1,
+    "eta_scale": 0.1,
+    "volatility_base": 0.3,
+    "last_calibration": "2025-05-18 11:16:15",
+    "sample_count": 81,
+    "validation_mape": 2777782.8353878837,
+    "validation_mae": 70.54463203373496,
+    "validation_r2": -9.075909571842569,
+    "log_transform_used": true,
+    "outlier_method": "iqr"
+  }
+}

@@ -220,6 +220,26 @@ class OrderBook:
             return None
             
         return total_cost / quantity
+    
+    def get_depth(self, side: str, depth: Optional[int] = None) -> float:
+        """
+        Calculate the total quantity available on one side of the book up to a specified depth.
+        
+        Args:
+            side: 'bid' or 'ask'
+            depth: Optional number of price levels to include
+            
+        Returns:
+            Total quantity available on the specified side
+        """
+        if side.lower() in ['bid', 'bids']:
+            price_levels = self.get_bids(depth)
+        elif side.lower() in ['ask', 'asks']:
+            price_levels = self.get_asks(depth)
+        else:
+            raise ValueError("Side must be 'bid' or 'ask'")
+            
+        return sum(qty for _, qty in price_levels)
 
 
 # Example usage

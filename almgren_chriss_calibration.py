@@ -115,14 +115,104 @@ class AlmgrenChrissCalibrator:
         mape = mean_absolute_percentage_error(actual_slippage, predicted_slippage)
         return mape
     
-    def calibrate_parameters(self, symbol: str = None):
+    def handle_outliers(self, data: pd.DataFrame, columns: List[str], method: str = 'iqr', k: float = 1.5) -> pd.DataFrame:
         """
-        Calibrate Almgren-Chriss parameters using historical data.
+        Detect and handle outliers in the calibration data.
         
         Args:
-            symbol: Market symbol to calibrate (e.g., 'BTC-USDT'). 
-                   If None, calibrates for all markets with sufficient data.
-                   
+            data: DataFrame containing the calibration data
+            columns: List of columns to check for outliers
+            method: Method for outlier detection ('iqr', 'zscore', or 'percentile')
+            k: Threshold factor for outlier detection
+            
+        Returns:
+            DataFrame with outliers handled
+        """
+        clean_data = data.copy()
+        
+        for col in columns:
+            if col not in clean_data.columns:
+                continue
+            
+            if method == 'iqr':
+                # Interquartile range method
+                Q1 = clean_data[col].quantile(0.25)
+                Q3 = clean_data[col].quantile(0.75)
+                IQR = Q3 - Q1
+                lower_bound = Q1 - k * IQR
+                upper_bound = Q3 + k * IQR
+                
+                # Identify outliers
+                outliers = (clean_data[col] < lower_bound) | (clean_data[col] > upper_bound)
+                print(f"Found {outliers.sum()} outliers in {col} using IQR method")
+                
+            elif method == 'zscore':
+                # Z-score method
+                mean = clean_data[col].mean()
+                std = clean_data[col].std()
+                z_scores = (clean_data[col] - mean) / std
+                outliers = abs(z_scores) > k
+                print(f"Found {outliers.sum()} outliers in {col} using Z-score method")
+                
+            elif method == 'percentile':
+                # Percentile method
+                lower_bound = clean_data[col].quantile(0.01)
+                upper_bound = clean_data[col].quantile(0.99)
+                outliers = (clean_data[col] < lower_bound) | (clean_data[col] > upper_bound)
+                print(f"Found {outliers.sum()} outliers in {col} using percentile method")
+                
+            else:
+                raise ValueError(f"Unknown outlier detection method: {method}")
+            
+            # Handle outliers - can either remove or cap
+            if outliers.sum() > 0:
+                # Option 1: Cap outliers at the bounds
+                clean_data.loc[clean_data[col] < lower_bound, col] = lower_bound
+                clean_data.loc[clean_data[col] > upper_bound, col] = upper_bound
+                
+                # Option 2: Remove outliers (commented out)
+                # clean_data = clean_data[~outliers]
+        
+        return clean_data
+
+    def log_transform_data(self, data: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+        """
+        Apply log transformation to improve linearity for regression.
+        
+        Args:
+            data: DataFrame containing the calibration data
+            columns: List of columns to log transform
+            
+        Returns:
+            DataFrame with log-transformed columns
+        """
+        transformed_data = data.copy()
+        
+        for col in columns:
+            if col in transformed_data.columns:
+                # Ensure values are positive for log transform
+                min_val = transformed_data[col].min()
+                if min_val <= 0:
+                    # Add small offset to make all values positive
+                    offset = abs(min_val) + 1e-6
+                    transformed_data[col] = transformed_data[col] + offset
+                
+                # Apply log transform
+                transformed_data[f'log_{col}'] = np.log(transformed_data[col])
+        
+        return transformed_data
+
+    def calibrate_parameters_robust(self, symbol: str = None, outlier_method: str = 'iqr', 
+                                   log_transform: bool = True, constraint_bounds: bool = True):
+        """
+        Robustly calibrate Almgren-Chriss parameters with outlier handling and constraints.
+        
+        Args:
+            symbol: Market symbol to calibrate (e.g., 'BTC-USDT')
+            outlier_method: Method for outlier detection ('iqr', 'zscore', or 'percentile')
+            log_transform: Whether to apply log transformation for better linearity
+            constraint_bounds: Whether to constrain parameters within typical bounds
+            
         Returns:
             Dictionary with calibration results
         """
@@ -143,18 +233,53 @@ class AlmgrenChrissCalibrator:
         for market in markets:
             market_data = data[data['symbol'] == market]
             
+            # Handle outliers in key calibration columns
+            market_data = self.handle_outliers(
+                market_data, 
+                columns=['slippage_bps', 'quantity_usd', 'volatility'],
+                method=outlier_method
+            )
+            
+            # Apply log transformation if requested
+            if log_transform:
+                market_data = self.log_transform_data(
+                    market_data, 
+                    columns=['slippage_bps', 'quantity_usd']
+                )
+                # Use transformed columns for regression
+                slippage_col = 'log_slippage_bps'
+                quantity_col = 'log_quantity_usd'
+            else:
+                slippage_col = 'slippage_bps'
+                quantity_col = 'quantity_usd'
+            
             # Split data for training and validation
             train_data, val_data = train_test_split(market_data, test_size=0.3, random_state=42)
             
             # Create a sample order book for this market
             order_book = OrderBook(market)
             
+            # Ensure we have numeric columns with proper values
+            for df in [train_data, val_data]:
+                for col in ['bid_price', 'ask_price', 'bid_volume', 'ask_volume', 'volatility']:
+                    if col not in df.columns:
+                        df[col] = 0.0  # Add default values if missing
+                    else:
+                        # Ensure values are numeric
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                        # Fill any NaN with reasonable defaults
+                        if col in ['bid_price', 'ask_price']:
+                            df[col].fillna(50000.0, inplace=True)
+                        elif col in ['bid_volume', 'ask_volume']:
+                            df[col].fillna(1.0, inplace=True)
+                        elif col == 'volatility':
+                            df[col].fillna(0.3, inplace=True)
+            
             # Calculate average order book state from the data
-            # In a real implementation, you'd use actual order book snapshots
-            avg_bid_price = train_data.get('bid_price', 50000).mean()
-            avg_ask_price = train_data.get('ask_price', 50100).mean()
-            avg_bid_qty = train_data.get('bid_volume', 1.0).mean()
-            avg_ask_qty = train_data.get('ask_volume', 1.0).mean()
+            avg_bid_price = train_data['bid_price'].mean()
+            avg_ask_price = train_data['ask_price'].mean()
+            avg_bid_qty = train_data['bid_volume'].mean()
+            avg_ask_qty = train_data['ask_volume'].mean()
             
             # Create a sample order book
             sample_data = {
@@ -165,78 +290,182 @@ class AlmgrenChrissCalibrator:
             
             # Get quantities and side info from training data
             quantities = train_data['quantity_usd'].values
-            side = train_data['side'].iloc[0]  # Use most common side
-            volatility = train_data['volatility'].mean()
             
-            # Initial parameter guess
-            initial_params = [1.0, 1.0]  # [gamma_scale, eta_scale]
+            # Get the most common side or default to "buy"
+            if 'side' in train_data.columns:
+                # Use most common side
+                sides = train_data['side'].value_counts()
+                side = sides.index[0] if len(sides) > 0 else "buy"
+            else:
+                side = "buy"
             
-            # Optimize the parameters
-            result = minimize(
-                self._objective_function,
-                initial_params,
-                args=(train_data, side, order_book, quantities, volatility),
-                method='Nelder-Mead',
-                bounds=[(0.01, 10.0), (0.01, 10.0)]
-            )
+            # Get volatility or use default
+            if 'volatility' in train_data.columns:
+                volatility = train_data['volatility'].mean()
+            else:
+                volatility = 0.3  # Default volatility
             
-            # Extract optimized parameters
-            gamma_scale, eta_scale = result.x
+            # Initial parameter guess - more reasonable starting point
+            initial_params = [0.8, 1.2]  # [gamma_scale, eta_scale]
             
-            # Calculate validation error
-            val_quantities = val_data['quantity_usd'].values
-            val_actual = val_data['slippage_bps'].values
-            val_predicted = []
+            # Use robust optimization with constraints
+            from scipy.optimize import minimize
             
-            # Calculate market depth for validation
-            depth = ac.calculate_market_depth(order_book)
+            if constraint_bounds:
+                # Add constraints to keep parameters in reasonable ranges
+                bounds = [(0.1, 5.0), (0.1, 5.0)]  # gamma_scale, eta_scale
+                options = {'maxiter': 100}
+                method = 'L-BFGS-B'
+            else:
+                bounds = [(0.01, 10.0), (0.01, 10.0)]
+                options = None
+                method = 'Nelder-Mead'
             
-            for quantity in val_quantities:
-                base_gamma = ac.estimate_temporary_impact(depth, volatility)
-                base_eta = ac.estimate_permanent_impact(depth)
+            # Optimize the parameters with robust approach
+            try:
+                result = minimize(
+                    self._objective_function,
+                    initial_params,
+                    args=(train_data, side, order_book, quantities, volatility),
+                    method=method,
+                    bounds=bounds,
+                    options=options
+                )
                 
-                gamma = base_gamma * gamma_scale
-                eta = base_eta * eta_scale
+                # Extract optimized parameters
+                gamma_scale, eta_scale = result.x
                 
-                direction = 1 if side.lower() == 'buy' else -1
-                temporary_impact = direction * gamma * quantity
-                permanent_impact = direction * eta * quantity
-                total_impact = permanent_impact + 0.5 * temporary_impact
+                # Apply typical bounds if requested
+                if constraint_bounds:
+                    gamma_scale = max(0.1, min(gamma_scale, 5.0))
+                    eta_scale = max(0.1, min(eta_scale, 5.0))
                 
-                val_predicted.append(total_impact * 10000)  # Convert to basis points
-            
-            # Calculate validation metrics
-            val_mape = mean_absolute_percentage_error(val_actual, val_predicted)
-            val_mae = mean_absolute_error(val_actual, val_predicted)
-            val_r2 = r2_score(val_actual, val_predicted)
-            
-            # Store calibrated parameters
-            self.market_params[market] = {
-                'gamma_scale': gamma_scale,
-                'eta_scale': eta_scale,
-                'volatility_base': volatility,
-                'last_calibration': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'sample_count': len(train_data),
-                'validation_mape': val_mape,
-                'validation_mae': val_mae,
-                'validation_r2': val_r2
-            }
-            
-            calibration_results[market] = {
-                'gamma_scale': gamma_scale,
-                'eta_scale': eta_scale,
-                'training_records': len(train_data),
-                'validation_records': len(val_data),
-                'validation_mape': val_mape,
-                'validation_mae': val_mae,
-                'validation_r2': val_r2
-            }
+                # Calculate validation error using original (untransformed) values
+                val_quantities = val_data['quantity_usd'].values
+                val_actual = val_data['slippage_bps'].values
+                val_predicted = []
+                
+                # Calculate market depth for validation
+                depth = ac.calculate_market_depth(order_book)
+                
+                for quantity in val_quantities:
+                    base_gamma = ac.estimate_temporary_impact(depth, volatility)
+                    base_eta = ac.estimate_permanent_impact(depth)
+                    
+                    gamma = base_gamma * gamma_scale
+                    eta = base_eta * eta_scale
+                    
+                    direction = 1 if side.lower() == 'buy' else -1
+                    temporary_impact = direction * gamma * quantity
+                    permanent_impact = direction * eta * quantity
+                    total_impact = permanent_impact + 0.5 * temporary_impact
+                    
+                    val_predicted.append(total_impact * 10000)  # Convert to basis points
+                
+                # Calculate validation metrics
+                val_mape = mean_absolute_percentage_error(val_actual, val_predicted)
+                val_mae = mean_absolute_error(val_actual, val_predicted)
+                val_r2 = r2_score(val_actual, val_predicted)
+                
+                # Store calibrated parameters
+                self.market_params[market] = {
+                    'gamma_scale': gamma_scale,
+                    'eta_scale': eta_scale,
+                    'volatility_base': volatility,
+                    'last_calibration': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'sample_count': len(train_data),
+                    'validation_mape': val_mape,
+                    'validation_mae': val_mae,
+                    'validation_r2': val_r2,
+                    'log_transform_used': log_transform,
+                    'outlier_method': outlier_method
+                }
+                
+                calibration_results[market] = {
+                    'gamma_scale': gamma_scale,
+                    'eta_scale': eta_scale,
+                    'training_records': len(train_data),
+                    'validation_records': len(val_data),
+                    'validation_mape': val_mape,
+                    'validation_mae': val_mae,
+                    'validation_r2': val_r2,
+                    'optimization_success': result.success,
+                    'optimization_message': str(result.message) if hasattr(result, 'message') else None
+                }
+            except Exception as e:
+                print(f"Optimization error for {market}: {e}")
+                # Use default parameters
+                calibration_results[market] = {
+                    'gamma_scale': 1.0,
+                    'eta_scale': 1.0,
+                    'training_records': len(train_data),
+                    'validation_records': len(val_data),
+                    'validation_mape': 0.0,
+                    'validation_mae': 0.0,
+                    'validation_r2': 0.0,
+                    'optimization_success': False,
+                    'optimization_message': str(e)
+                }
         
         # Save calibrated parameters
         self._save_params()
         
         return calibration_results
-    
+
+    def get_dynamic_parameters(self, symbol: str, volatility: float, 
+                              time_of_day: float = None, recent_volume: float = None) -> Dict[str, float]:
+        """
+        Get dynamically adjusted parameters based on current market conditions.
+        
+        Args:
+            symbol: Market symbol (e.g., 'BTC-USDT')
+            volatility: Current market volatility
+            time_of_day: Hour of day (0-23.99)
+            recent_volume: Recent trading volume relative to average
+            
+        Returns:
+            Dictionary with dynamically adjusted parameters
+        """
+        # Get base calibrated parameters
+        base_params = self.get_market_parameters(symbol, volatility)
+        gamma_scale = base_params.get('gamma_scale', 1.0)
+        eta_scale = base_params.get('eta_scale', 1.0)
+        volatility_adjustment = base_params.get('volatility_adjustment', 1.0)
+        
+        # Apply time-of-day adjustment if provided
+        tod_adjustment = 1.0
+        if time_of_day is not None:
+            # Higher impact during market open/close or low liquidity periods
+            # This is a simple model - can be refined with actual market data
+            hour = time_of_day
+            if 0 <= hour < 2 or 22 <= hour < 24:  # Late night/early morning
+                tod_adjustment = 1.2  # 20% higher impact
+            elif 8 <= hour < 10 or 14 <= hour < 16:  # Market open/close periods
+                tod_adjustment = 1.1  # 10% higher impact
+            elif 10 <= hour < 14:  # Mid-day
+                tod_adjustment = 0.95  # 5% lower impact
+        
+        # Apply volume adjustment if provided
+        volume_adjustment = 1.0
+        if recent_volume is not None:
+            # Lower impact when volume is high, higher when volume is low
+            if recent_volume > 1.5:  # 50% above average volume
+                volume_adjustment = 0.9  # 10% lower impact
+            elif recent_volume < 0.7:  # 30% below average volume
+                volume_adjustment = 1.15  # 15% higher impact
+        
+        # Combine all adjustments
+        final_gamma_scale = gamma_scale * tod_adjustment * volume_adjustment
+        final_eta_scale = eta_scale * tod_adjustment  # Permanent impact less affected by time
+        
+        return {
+            'gamma_scale': final_gamma_scale,
+            'eta_scale': final_eta_scale,
+            'volatility_adjustment': volatility_adjustment,
+            'tod_adjustment': tod_adjustment,
+            'volume_adjustment': volume_adjustment
+        }
+
     def get_market_parameters(self, symbol: str, volatility: float) -> Dict[str, float]:
         """
         Get calibrated parameters for a specific market.
@@ -282,7 +511,7 @@ if __name__ == "__main__":
     calibrator = AlmgrenChrissCalibrator()
     
     try:
-        results = calibrator.calibrate_parameters()
+        results = calibrator.calibrate_parameters_robust()
         print("Calibration results:")
         for market, result in results.items():
             print(f"\n{market}:")

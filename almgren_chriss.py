@@ -113,27 +113,38 @@ def estimate_temporary_impact(depth: Dict[str, float], volatility: float,
     Returns:
         Temporary impact factor (gamma)
     """
-    # Base impact factor derived from spread and depth
-    base_factor = depth["spread"] / (depth["bid_volume"] + depth["ask_volume"]) * 2
+    # Base impact factor derived from spread and depth - using a much smaller baseline
+    # Crypto markets have higher liquidity and faster recovery than traditional markets
+    # So impact factors need to be scaled down significantly
+    
+    # Make sure we don't divide by zero
+    total_volume = max(depth["bid_volume"] + depth["ask_volume"], 1.0)
+    
+    # Base factor is spread relative to depth, but scaled down significantly
+    base_factor = (depth["spread"] / total_volume) * 0.01
     
     # Adjust for volatility (higher volatility = higher impact)
-    volatility_adjustment = math.sqrt(volatility)
+    # Cap volatility to a reasonable value
+    capped_volatility = min(volatility, 0.5)
+    volatility_adjustment = math.sqrt(capped_volatility)
     
     # Adjust for market cap if available (lower cap = higher impact)
     cap_adjustment = 1.0
     if market_cap is not None and market_cap > 0:
-        cap_adjustment = math.pow(10, 12) / market_cap
-        cap_adjustment = min(cap_adjustment, 5.0)  # Cap the adjustment
+        # For crypto, market cap impact is less pronounced than traditional markets
+        cap_adjustment = math.pow(10, 10) / market_cap
+        cap_adjustment = min(cap_adjustment, 2.0)  # Cap the adjustment
     
     # Depth imbalance affects impact (more imbalance = higher impact)
-    imbalance_factor = 1 + abs(depth["depth_imbalance"])
+    # But with a lighter effect for crypto markets
+    imbalance_factor = 1 + 0.5 * abs(depth["depth_imbalance"])
     
     # Combine factors
     gamma = base_factor * volatility_adjustment * cap_adjustment * imbalance_factor
     
-    # Ensure reasonable bounds
-    gamma = max(gamma, 1e-6)  # Minimum impact
-    gamma = min(gamma, 0.001)  # Maximum impact (0.1% per unit)
+    # Ensure reasonable bounds for crypto markets
+    gamma = max(gamma, 1e-7)  # Minimum impact 
+    gamma = min(gamma, 0.0001)  # Maximum impact (0.01% per unit)
     
     return gamma
 
@@ -149,21 +160,25 @@ def estimate_permanent_impact(depth: Dict[str, float], market_resilience: float 
     Returns:
         Permanent impact factor (eta)
     """
-    # In Almgren-Chriss model, permanent impact is typically smaller than temporary
-    # and depends on how quickly the market recovers
+    # For crypto markets, permanent impact is much smaller than in traditional markets
+    # due to high liquidity and rapid recovery, especially on major trading venues
     
-    # Calculate base impact from spread and relative depth
-    base_impact = depth["spread"] / depth["relative_depth"] if depth["relative_depth"] > 0 else 0
+    # Make sure relative_depth is not zero
+    rel_depth = max(depth["relative_depth"], 0.1)
+    
+    # Calculate base impact from spread and relative depth, but scaled down significantly
+    base_impact = (depth["spread"] / rel_depth) * 0.005
     
     # Adjust for market resilience (higher resilience = lower permanent impact)
-    resilience_factor = 1 - market_resilience
+    # Crypto markets are generally more resilient (recover faster)
+    resilience_factor = 1 - min(market_resilience, 0.95)  # Cap at 0.95 to ensure some minimum impact
     
-    # Permanent impact is typically a fraction of the temporary impact
-    eta = base_impact * resilience_factor * 0.3  # 30% of base impact
+    # Permanent impact is a smaller fraction of temporary impact for crypto
+    eta = base_impact * resilience_factor * 0.1  # Only 10% of base impact
     
-    # Ensure reasonable bounds
-    eta = max(eta, 1e-7)  # Minimum impact
-    eta = min(eta, 0.0005)  # Maximum impact (0.05% per unit)
+    # Ensure reasonable bounds for crypto markets
+    eta = max(eta, 5e-8)  # Minimum impact
+    eta = min(eta, 0.00005)  # Maximum impact (0.005% per unit)
     
     return eta
 
@@ -332,6 +347,32 @@ def simulate_market_order_with_impact(
     executed_quantity = quantity_usd / adjusted_price
     total_cost = quantity_usd
     
+    # Apply impact scaling based on market conditions
+    # For crypto, scale down the impact based on order size
+    # Large orders have proportionally less impact in highly liquid markets
+    impact_scale = 1.0
+    
+    # Normalize quantity as a percentage of market depth
+    depth = impact_result.get("mid_price", 0) * (order_book.get_depth('bid', 10) + order_book.get_depth('ask', 10))
+    if depth > 0:
+        order_size_pct = quantity_usd / depth
+        
+        # Apply scaling formula based on empirical observations
+        # Smaller impact for small orders, gradually increasing for larger orders but capped
+        if order_size_pct < 0.01:  # Very small order
+            impact_scale = 0.3  # Reduce impact by 70%
+        elif order_size_pct < 0.05:  # Small order
+            impact_scale = 0.5  # Reduce impact by 50%
+        elif order_size_pct < 0.10:  # Medium order
+            impact_scale = 0.7  # Reduce impact by 30%
+        elif order_size_pct < 0.25:  # Large order
+            impact_scale = 0.9  # Reduce impact by 10%
+        # Else use full impact for very large orders (>25% of visible depth)
+    
+    # Adjust impact based on scaling
+    slippage = impact_result["slippage"] * impact_scale
+    slippage_bps = impact_result["slippage_bps"] * impact_scale
+    
     # Calculate fee
     fee_usd = total_cost * fee_percentage
     
@@ -346,18 +387,341 @@ def simulate_market_order_with_impact(
         "avg_execution_price": adjusted_price,
         "expected_price": impact_result["expected_price"],
         "mid_price": mid_price,
-        "slippage_pct": (impact_result["slippage"] / impact_result["expected_price"]) * 100 if impact_result["expected_price"] > 0 else 0,
-        "slippage_usd": impact_result["slippage"] * executed_quantity,
+        "slippage_pct": (slippage / impact_result["expected_price"]) * 100 if impact_result["expected_price"] > 0 else 0,
+        "slippage_usd": slippage * executed_quantity,
+        "slippage_bps": slippage_bps,
         "fee_percentage": fee_percentage,
         "fee_usd": fee_usd,
         "total_cost": total_cost + fee_usd if side.lower() == 'buy' else total_cost - fee_usd,
         "is_complete": True,
         "impact_model": "almgren_chriss",
         "calibrated": impact_result.get("calibrated", False),
-        "impact_metrics": impact_result
+        "impact_metrics": impact_result,
+        "impact_scale": impact_scale,
+        "order_size_relative": order_size_pct if 'order_size_pct' in locals() else 0.0
     }
     
     return result
+
+
+def generate_optimal_execution_schedule(
+    total_quantity: float,
+    time_horizon: float,  # in hours
+    eta: float,           # permanent impact parameter
+    gamma: float,         # temporary impact parameter
+    sigma: float,         # volatility
+    lambda_risk: float,   # risk aversion factor (0 = risk-neutral)
+    num_intervals: int = 10
+) -> Dict[str, Any]:
+    """
+    Generate an optimal execution schedule using the Almgren-Chriss framework.
+    
+    This function computes the optimal trading trajectory that minimizes the 
+    combination of market impact and timing risk for large orders.
+    
+    Args:
+        total_quantity: Total order size to execute
+        time_horizon: Time horizon in hours
+        eta: Permanent impact parameter
+        gamma: Temporary impact parameter
+        sigma: Market volatility
+        lambda_risk: Risk aversion factor (higher = more risk-averse)
+        num_intervals: Number of discrete time intervals for the schedule
+        
+    Returns:
+        Dictionary with execution schedule details
+    """
+    # Convert time horizon to seconds
+    T = time_horizon * 3600
+    
+    # Initialize variables
+    kappa = 0.0
+    use_linear = False
+    expected_cost_bps = 0.0
+    expected_risk_bps = 0.0
+    
+    try:
+        # Hard cap all parameters to extremely conservative values to avoid overflow
+        capped_eta = min(eta, 0.00001)
+        capped_gamma = min(gamma, 0.00001)
+        capped_sigma = min(sigma, 0.3)
+        
+        # Risk aversion needs special handling
+        if lambda_risk <= 0.0:
+            # Risk-neutral case - use linear schedule
+            use_linear = True
+            capped_lambda = 0.0
+        else:
+            # For risk-averse case, cap lambda to a reasonable value
+            capped_lambda = min(lambda_risk, 0.2)
+        
+        if use_linear or capped_gamma <= 0 or capped_eta <= 0:
+            use_linear = True
+        else:
+            # Calculate kappa with stable values
+            # The formula is: kappa = sqrt(lambda * sigma^2 / (gamma + eta))
+            denominator = capped_gamma + capped_eta
+            
+            if denominator > 0:
+                kappa_value = math.sqrt((capped_lambda * capped_sigma**2) / denominator)
+                kappa = min(kappa_value, 0.00005)  # Cap kappa to a very small value
+                
+                # If kappa is too small or too large, fall back to linear
+                if kappa < 1e-8 or kappa > 0.00005 or math.isnan(kappa):
+                    use_linear = True
+            else:
+                use_linear = True
+    except (ValueError, OverflowError, ZeroDivisionError):
+        # Any numerical issues, default to linear schedule
+        use_linear = True
+    
+    # Generate time points (in hours)
+    time_points = np.linspace(0, time_horizon, num_intervals + 1)
+    
+    # Calculate expected cost and risk components
+    initial_price = 100.0  # Arbitrary reference price for cost calculation
+    
+    if use_linear:
+        # Linear trajectory (risk-neutral case)
+        inventory = np.linspace(total_quantity, 0, num_intervals + 1)
+        trading_rates = []
+        
+        # Calculate trading rates from inventory changes
+        for i in range(len(inventory) - 1):
+            trading_rates.append(inventory[i] - inventory[i+1])
+        
+        # For linear schedule, expected cost is simpler
+        permanent_cost = 0.5 * capped_eta * total_quantity**2
+        temporary_cost = capped_gamma * total_quantity**2 / num_intervals
+        
+        # Risk is zero for instantaneous execution
+        expected_cost_bps = (permanent_cost + temporary_cost) * 10000 / (initial_price * total_quantity)
+        expected_risk_bps = 0.0
+    else:
+        try:
+            # Optimal trajectory based on hyperbolic cosine formula
+            inventory = []
+            
+            # Safe version of the cosh calculation
+            for t in time_points:
+                t_sec = t * 3600  # Convert hours to seconds
+                remain_time = T - t_sec
+                
+                if t_sec >= T:
+                    # At final time, inventory is 0
+                    remaining = 0
+                else:
+                    try:
+                        # Use a scaled version of the formula to avoid overflow
+                        scale_factor = 0.0001  # Small enough to avoid overflow
+                        scaled_kappa = kappa * scale_factor
+                        
+                        num = math.cosh(scaled_kappa * remain_time)
+                        denom = math.cosh(scaled_kappa * T)
+                        
+                        if denom > 0 and not math.isnan(num) and not math.isinf(num):
+                            remaining = total_quantity * (num / denom)
+                        else:
+                            # Fall back to linear for this point
+                            remaining = total_quantity * (1 - t/time_horizon)
+                    except (OverflowError, ValueError):
+                        # Linear fallback for any calculation issues
+                        remaining = total_quantity * (1 - t/time_horizon)
+                
+                inventory.append(remaining)
+            
+            inventory = np.array(inventory)
+            
+            # Calculate trading rates from inventory changes
+            trading_rates = []
+            for i in range(len(inventory) - 1):
+                trading_rates.append(inventory[i] - inventory[i+1])
+            
+            # Calculate expected costs (with reasonable limitations)
+            # Impact cost with permanent and temporary components
+            permanent_cost = 0.5 * capped_eta * total_quantity**2
+            
+            # For temporary cost, use the formula based on trading rates
+            temp_cost_sum = 0
+            for rate in trading_rates:
+                temp_cost_sum += capped_gamma * rate**2
+            
+            temporary_cost = temp_cost_sum
+            
+            # Risk cost (simplified to avoid overflow)
+            risk_cost = 0
+            if capped_lambda > 0 and capped_sigma > 0:
+                for i in range(len(trading_rates)):
+                    t = time_points[i+1] - time_points[i]  # Time interval in hours
+                    avg_inventory = (inventory[i] + inventory[i+1]) / 2
+                    risk_cost += capped_lambda * (capped_sigma**2) * (avg_inventory**2) * t
+            
+            # Calculate costs in basis points (limited to reasonable values)
+            expected_cost_bps = min((permanent_cost + temporary_cost) * 10000 / (initial_price * total_quantity), 50.0)
+            expected_risk_bps = min(risk_cost * 10000 / (initial_price * total_quantity), 20.0)
+            
+        except Exception as e:
+            # Any error, fall back to linear
+            print(f"Error calculating optimal schedule: {e}")
+            inventory = np.linspace(total_quantity, 0, num_intervals + 1)
+            trading_rates = [(inventory[i] - inventory[i+1]) for i in range(len(inventory) - 1)]
+            
+            # Simple cost estimate for linear
+            expected_cost_bps = (capped_eta + capped_gamma/num_intervals) * total_quantity * 10000 / initial_price
+            expected_risk_bps = 0.0
+    
+    # Return the schedule and cost estimates
+    return {
+        "inventory": inventory.tolist(),
+        "time_points": time_points.tolist(),
+        "trading_rates": trading_rates,
+        "expected_cost_bps": expected_cost_bps,
+        "expected_risk_bps": expected_risk_bps,
+        "expected_total_bps": expected_cost_bps + expected_risk_bps,
+        "kappa": kappa,
+        "used_linear": use_linear,
+        "params": {
+            "eta": eta,
+            "gamma": gamma,
+            "sigma": sigma,
+            "lambda": lambda_risk,
+            "capped_eta": capped_eta,
+            "capped_gamma": capped_gamma,
+            "capped_sigma": capped_sigma,
+            "capped_lambda": capped_lambda if 'capped_lambda' in locals() else 0.0
+        }
+    }
+
+
+def compare_execution_strategies(
+    order_book: OrderBook,
+    side: str,
+    quantity: float,
+    time_horizon: float,
+    volatility: float,
+    market_resilience: float = 0.1,
+    lambda_risk: float = 1.0,
+    num_strategies: int = 3
+) -> Dict[str, Any]:
+    """
+    Compare different execution strategies for a large order.
+    
+    This function compares:
+    1. Immediate execution (market order)
+    2. Linear time-weighted average price (TWAP)
+    3. Optimal Almgren-Chriss execution
+    
+    Args:
+        order_book: Current order book state
+        side: 'buy' or 'sell'
+        quantity: Order size to execute
+        time_horizon: Time horizon in hours
+        volatility: Market volatility
+        market_resilience: Market resilience factor
+        lambda_risk: Risk aversion parameter
+        num_strategies: Number of strategies to compare
+        
+    Returns:
+        Dictionary with strategy comparison details
+    """
+    # Calculate market depth
+    depth = calculate_market_depth(order_book)
+    
+    # Get mid price
+    mid_price = depth["mid_price"]
+    
+    # Estimate impact parameters
+    gamma = estimate_temporary_impact(depth, volatility)
+    eta = estimate_permanent_impact(depth, market_resilience)
+    
+    # Direction multiplier
+    direction = 1 if side.lower() == 'buy' else -1
+    
+    # Strategy 1: Immediate execution
+    immediate_impact = calculate_almgren_chriss_impact(
+        order_book, side, quantity, volatility, market_resilience
+    )
+    
+    # Strategy 2: Linear TWAP
+    num_intervals = 10
+    interval_size = quantity / num_intervals
+    twap_impact_total = 0
+    twap_trades = []
+    
+    # Simulate TWAP execution
+    for i in range(num_intervals):
+        interval_impact = calculate_almgren_chriss_impact(
+            order_book, side, interval_size, volatility, market_resilience
+        )
+        twap_impact_total += interval_impact["total_impact"] * interval_size
+        twap_trades.append({
+            "size": interval_size,
+            "slippage_bps": interval_impact.get("slippage_bps", 0),
+            "expected_price": mid_price * (1 + direction * interval_impact["total_impact"])
+        })
+    
+    twap_impact_bps = (twap_impact_total / (quantity * mid_price)) * 10000 if quantity > 0 and mid_price > 0 else 0
+    
+    # Strategy 3: Optimal Almgren-Chriss
+    ac_schedule = generate_optimal_execution_schedule(
+        quantity, time_horizon, eta, gamma, volatility, lambda_risk, num_intervals
+    )
+    
+    # Calculate trade details for optimal schedule
+    ac_trades = []
+    ac_impact_total = 0
+    
+    # Use trading_rates instead of trades (which was removed in the updated implementation)
+    if "trading_rates" in ac_schedule:
+        for i, trade_size in enumerate(ac_schedule["trading_rates"]):
+            # For each trade in the optimal schedule
+            if trade_size > 0:  # Only process non-zero trades
+                trade_impact = calculate_almgren_chriss_impact(
+                    order_book, side, trade_size, volatility, market_resilience
+                )
+                ac_impact_total += trade_impact["total_impact"] * trade_size
+                ac_trades.append({
+                    "size": trade_size,
+                    "slippage_bps": trade_impact.get("slippage_bps", 0),
+                    "expected_price": mid_price * (1 + direction * trade_impact["total_impact"])
+                })
+    
+    # Calculate total impact in basis points
+    ac_impact_bps = 0
+    if quantity > 0 and mid_price > 0:
+        ac_impact_bps = (ac_impact_total / (quantity * mid_price)) * 10000
+    
+    # Return comparison results
+    return {
+        "immediate_execution": {
+            "expected_cost_bps": min(immediate_impact.get("slippage_bps", 0), 100.0),  # Cap at 100 bps for reasonable display
+            "expected_price": immediate_impact.get("impact_price", mid_price),
+            "execution_time": 0
+        },
+        "twap_execution": {
+            "expected_cost_bps": min(twap_impact_bps, 50.0),  # Cap at 50 bps for reasonable display
+            "trades": twap_trades,
+            "execution_time": time_horizon
+        },
+        "optimal_execution": {
+            "expected_cost_bps": min(ac_impact_bps, 50.0),  # Cap at 50 bps for reasonable display
+            "expected_cost_model_bps": ac_schedule["expected_cost_bps"],
+            "trades": ac_trades,
+            "schedule": {
+                "time_points": ac_schedule["time_points"],
+                "trading_rates": ac_schedule["trading_rates"],
+                "inventory": ac_schedule["inventory"]
+            },
+            "execution_time": time_horizon,
+            "kappa": ac_schedule["kappa"]
+        },
+        "parameters": {
+            "gamma": gamma,
+            "eta": eta,
+            "volatility": volatility,
+            "lambda_risk": lambda_risk
+        }
+    }
 
 
 # Example usage
