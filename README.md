@@ -1,7 +1,7 @@
 # Quantitative Trading Research and Simulation
 
 This repository contains various tools and simulations for quantitative trading research, including market order simulation, Almgren-Chriss optimal execution, and regression models for market impact.
-
+Started as a submission to one of the open source projects out there as a learning to what is an L2 Ordernotebook and what does it mean to trade in a trading simulation
 ## Features
 
 - Real-time L2 order book visualization and market order execution simulation.
