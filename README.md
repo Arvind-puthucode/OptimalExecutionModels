@@ -1,61 +1,41 @@
-# Market Order Simulator
+# Quantitative Trading Research and Simulation
 
-A real-time market order simulator that visualizes order book data and simulates market order execution with slippage and fee calculation.
+This repository contains various tools and simulations for quantitative trading research, including market order simulation, Almgren-Chriss optimal execution, and regression models for market impact.
 
 ## Features
 
-- Real-time L2 order book visualization
-- Market order simulation with "walking the book" logic
-- Slippage and trading fee calculation
-- Market impact analysis
-- Interactive Streamlit web interface
+- Real-time L2 order book visualization and market order execution simulation.
+- Optimal trade execution strategies (Almgren-Chriss).
+- Regression models for analyzing market impact.
+- Interactive web interfaces for visualization and analysis.
 
-## Components
+## Project Structure
 
-- `orderbook_client.py`: WebSocket client that connects to the order book data stream
-- `orderbook.py`: Data structure to maintain the L2 order book state
-- `market_order_simulator.py`: Logic to simulate market order execution
-- `app.py`: Streamlit web interface
+- `almgren_chriss_calibration.py`: Script for calibrating Almgren-Chriss model parameters.
+- `almgren_chriss_example.py`: Example usage of the Almgren-Chriss model.
+- `almgren_chriss_params.json`: Configuration for Almgren-Chriss parameters.
+- `almgren_chriss.py`: Implementation of the Almgren-Chriss optimal execution model.
+- `app.py`: Main Streamlit application for interactive simulations and visualizations.
+- `enhanced_regression_models.py`: Advanced regression models for market impact.
+- `market_impact_models.md`: Documentation on market impact models.
+- `market_order_simulator.py`: Logic for simulating market order execution.
+- `model_validation.py`: Scripts for validating models.
+- `orderbook_client.py`: WebSocket client for order book data.
+- `orderbook.py`: Data structure for maintaining L2 order book state.
+- `regression_models.py`: Basic regression models for market impact.
+- `requirements.txt`: Python dependencies.
+- `slippage_data.csv`: Sample data for slippage analysis.
 
-## Installation
+## Visualizations
 
-1. Clone the repository:
-```
-git clone <repository-url>
-cd <repository-directory>
-```
+### Dashboard Overview
 
-2. Install the required packages:
-```
-pip install -r requirements.txt
-```
+![Dashboard Overview](images/dashboard_1.png)
 
-## Usage
+### Model Comparison
 
-Run the Streamlit app:
-```
-streamlit run app.py
-```
-
-## Configuration
-
-The simulation allows you to configure:
-
-- Order quantity (in USD)
-- Market volatility factor
-- Fee tier
-- Order side (buy/sell)
-- Market (e.g., BTC-USDT-SWAP)
-- Execution delay
-- Price impact factor
-
-## Data Source
-
-The app connects to the following WebSocket endpoint to receive real-time order book data:
-```
-wss://ws.gomarket-cpp.goquant.io/ws/l2-orderbook/okx/BTC-USDT-SWAP
-```
+![Model Comparison](images/model_comparision.png)
 
 ## License
 
-MIT 
+MIT
